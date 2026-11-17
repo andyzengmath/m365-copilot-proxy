@@ -6055,9 +6055,10 @@ Responses API took them: the turn that first carried them ran two hours on the r
 carried them failed in 1–4 s with 400 "function_call_output.call_id is required", in the original
 thread and in a fork of it. A request with just those two items failed the same way on 2.6.23 and was
 answered on 2.9.12, which sends such items as user text (`<namespace>.<name>:` and the output;
-copilot-api #500, in 2.9.7 and later). npm's latest was 2.9.3, so the gateway now runs a source build of
-v2.9.12. On it Codex passed on `gpt-6.1-sol` and through `modelMappings` to the second provider, and
-Claude Code on `claude-sonnet-5`.
+copilot-api #500, in 2.9.7 and later). The public npm registry has had 2.9.12 since Nov 16, but the test
+PC's npm goes through a company mirror that still served 2.9.3 as `latest` and had no 2.9.7 or later, so
+the gateway now runs a source build of v2.9.12. On it Codex passed on `gpt-6.1-sol` and through
+`modelMappings` to the second provider, and Claude Code on `claude-sonnet-5`.
 
 ### Open (Nov 16)
 - **H41a** — StreamHub meters these turns as Chathub does but doesn't report it. **Falsify:** an Opus

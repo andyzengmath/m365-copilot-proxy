@@ -12,15 +12,17 @@ same options and hasn't been run end to end. Background and results:
 
 ## Do you need the copilot-api repo?
 
-Not to change it, but for now, to build it. The Codex app needs copilot-api 2.9.7 or later, and the
-latest `@jeffreycao/copilot-api` on npm is still 2.9.3 (GitHub releases are at 2.9.12). An older
-copilot-api rejects any request from the app that carries the app's own context, such as its page
-snapshot, with "function_call_output.call_id is required" (fixed upstream in
-[#500](https://github.com/caozhiyuan/copilot-api/pull/500)). Step 3 builds a release tag; once npm has
-2.9.7 or later, `npx` with the published package is enough. Claude Code and the Codex CLI worked on
-2.6.23 too. You need copilot-api only for Codex and Claude Code, and it doesn't need GitHub Copilot:
-with a provider configured and no GitHub login it starts in provider-only mode. If you already run it
-for Copilot, add the provider in step 3 and your Copilot models stay. Tested with 2.6.23 and 2.9.12.
+Usually not: run the published package, `@jeffreycao/copilot-api`, with `npx`, and clone the repo only to
+change copilot-api, or when your npm registry has no recent enough version. The Codex app needs 2.9.7
+or later. An older copilot-api rejects any request from the app that carries the app's own context,
+such as its page snapshot, with "function_call_output.call_id is required" (fixed upstream in
+[#500](https://github.com/caozhiyuan/copilot-api/pull/500)). The public npm registry has 2.9.12 (since
+Nov 16), but a registry mirror can lag: a company mirror still served 2.9.3 as `latest` and had no 2.9.7
+or later. `npm view @jeffreycao/copilot-api version` shows what yours serves; if it's older, step 3
+builds a release tag instead. Claude Code and the Codex CLI worked on 2.6.23 too. You need copilot-api
+only for Codex and Claude Code, and it doesn't need GitHub Copilot: with a provider configured and no
+GitHub login it starts in provider-only mode. If you already run it for Copilot, add the provider in
+step 3 and your Copilot models stay. Tested with 2.6.23 and 2.9.12.
 
 ## 1. Prerequisites
 
@@ -118,9 +120,14 @@ Create or edit `config.json` in copilot-api's home, `~/.local/share/copilot-api/
 }
 ```
 
-Until npm has 2.9.7 or later, build a release tag of
-[caozhiyuan/copilot-api](https://github.com/caozhiyuan/copilot-api). Its lockfile needs Bun 1.4.4 or
-later, which `npx -y bun@latest` runs without installing it:
+```sh
+npx @jeffreycao/copilot-api@latest start --port 4141
+```
+
+If you use the Codex app and your registry serves a version older than 2.9.7
+(`npm view @jeffreycao/copilot-api version`), build a release tag of
+[caozhiyuan/copilot-api](https://github.com/caozhiyuan/copilot-api) instead. Its lockfile needs Bun
+1.4.4 or later, which `npx -y bun@latest` runs without installing it:
 
 ```sh
 git clone --depth 1 --branch v2.9.12 https://github.com/caozhiyuan/copilot-api
@@ -128,12 +135,6 @@ cd copilot-api
 npx -y bun@latest install --frozen-lockfile --ignore-scripts
 npx -y bun@latest run build
 node dist/main.js start --port 4141
-```
-
-With npm at 2.9.7 or later, or for Claude Code and the Codex CLI alone:
-
-```sh
-npx @jeffreycao/copilot-api@latest start --port 4141
 ```
 
 It listens on 127.0.0.1 by default. Models appear as `m365/<model id>`, and any ID the proxy knows
