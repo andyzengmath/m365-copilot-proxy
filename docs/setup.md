@@ -12,11 +12,15 @@ same options and hasn't been run end to end. Background and results:
 
 ## Do you need the copilot-api repo?
 
-No. Run the published package, `@jeffreycao/copilot-api` (built from
-[caozhiyuan/copilot-api](https://github.com/caozhiyuan/copilot-api)), with `npx`. Clone the repo only
-to change copilot-api itself. You need copilot-api only for Codex and Claude Code, and it doesn't need
-GitHub Copilot: with a provider configured and no GitHub login it starts in provider-only mode. If you
-already run it for Copilot, add the provider in step 3 and your Copilot models stay. Tested with 2.6.23.
+Not to change it, but for now, to build it. The Codex app needs copilot-api 2.9.7 or later, and the
+latest `@jeffreycao/copilot-api` on npm is still 2.9.3 (GitHub releases are at 2.9.12). An older
+copilot-api rejects any request from the app that carries the app's own context, such as its page
+snapshot, with "function_call_output.call_id is required" (fixed upstream in
+[#500](https://github.com/caozhiyuan/copilot-api/pull/500)). Step 3 builds a release tag; once npm has
+2.9.7 or later, `npx` with the published package is enough. Claude Code and the Codex CLI worked on
+2.6.23 too. You need copilot-api only for Codex and Claude Code, and it doesn't need GitHub Copilot:
+with a provider configured and no GitHub login it starts in provider-only mode. If you already run it
+for Copilot, add the provider in step 3 and your Copilot models stay. Tested with 2.6.23 and 2.9.12.
 
 ## 1. Prerequisites
 
@@ -113,6 +117,20 @@ Create or edit `config.json` in copilot-api's home, `~/.local/share/copilot-api/
   }
 }
 ```
+
+Until npm has 2.9.7 or later, build a release tag of
+[caozhiyuan/copilot-api](https://github.com/caozhiyuan/copilot-api). Its lockfile needs Bun 1.4.4 or
+later, which `npx -y bun@latest` runs without installing it:
+
+```sh
+git clone --depth 1 --branch v2.9.12 https://github.com/caozhiyuan/copilot-api
+cd copilot-api
+npx -y bun@latest install --frozen-lockfile --ignore-scripts
+npx -y bun@latest run build
+node dist/main.js start --port 4141
+```
+
+With npm at 2.9.7 or later, or for Claude Code and the Codex CLI alone:
 
 ```sh
 npx @jeffreycao/copilot-api@latest start --port 4141
@@ -222,6 +240,7 @@ Each should create `hello.txt`. After a reboot, start the proxy, then copilot-ap
 |---|---|---|
 | Sign-in refused: the device or browser doesn't meet your organization's requirements | Conditional Access admits only compliant devices | Sign in on a device it admits (step 2, Conditional Access) |
 | Codex: "Reconnecting… waiting for network", then "error sending request" | Nothing answers on the thread's provider port: the proxy or copilot-api is down, or the thread started on a provider whose server isn't running | Start them; or open a new thread |
+| copilot-api 400 "function_call_output.call_id is required" | copilot-api before 2.9.7, with the Codex app adding its own context to the turn | Run 2.9.7 or later (step 3), then retry the turn |
 | copilot-api 400 "This model does not support the responses endpoint" | A model name without `m365/`, often one the app saved from another provider | Pick an `m365/…` model; keep only gateway models in the catalog |
 | copilot-api 400 "does not support tool 'web_search'" | Codex's hosted search | `web_search = "disabled"` |
 | The Codex app shows the provider's name instead of your ChatGPT account | `requires_openai_auth = false` | Step 4 |
