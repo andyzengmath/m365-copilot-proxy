@@ -214,14 +214,48 @@ app's account menu; the CLI ran with this file and no ChatGPT login. Things to k
 - **The app keeps each thread on the provider it started with,** and saves the model you last picked
   as the default without its provider. Keep only gateway models in the catalog (or put other backends
   behind copilot-api too: [claude-code-codex.md](claude-code-codex.md), step 5).
-- **Context windows** come only from the catalog. Codex compacts at 90% of a window, but the gateway
-  reports 0 tokens used, so for `m365/*` models Codex never compacts and M365 holds the context.
+- **Context windows** come from the catalog. The gateway reports 0 tokens used, so Codex cannot
+  track M365's actual context usage. M365 holds the conversation history.
 - **Metered models.** On Chathub `claude-opus` (Opus 5.5) is limited to 40 turns a day and
   `claude-sonnet-5.5` to 80, every tool call a turn, while `gpt-6.1-sol` and `claude-sonnet-5` spend no
   allowance. StreamHub reports no meters at all (hypotheses §41), so prefer the unmetered models.
 - **Sandbox.** On Windows, Codex 0.157 refused every command in its sandbox, `workspace-write`
   included ("blocked by policy", even `echo`), so the tested runs used
   `--dangerously-bypass-approvals-and-sandbox`. On macOS and Linux use `-s workspace-write`.
+
+### Long-context catalog
+
+The default catalog configures a 1,000,000-token window. For the long-context setup, use 1,050,000
+tokens for [GPT-6 Astra](https://developers.openai.com/api/docs/models/gpt-6-astra),
+[GPT-6 Sol](https://developers.openai.com/api/docs/models/gpt-6-sol),
+[GPT-6.1 Sol](https://developers.openai.com/api/docs/models/gpt-6.1-sol),
+[GPT-6.2 Astra](https://developers.openai.com/api/docs/models/gpt-6.2-astra), and
+[GPT-6.2 Sol](https://developers.openai.com/api/docs/models/gpt-6.2-sol), based on their published
+OpenAI API context windows. Keep 1,000,000 as the catalog fallback for the other M365 models.
+
+From the repo root in PowerShell, with the gateway running, discover every M365 model and pass
+`MODEL=WINDOW` for the five overrides. Use this instead of `--all` when refreshing the catalog so
+the overrides are preserved:
+
+```powershell
+$longContext = @(
+  'm365/gpt-6-astra',
+  'm365/gpt-6-sol',
+  'm365/gpt-6.1-sol',
+  'm365/gpt-6.2-astra',
+  'm365/gpt-6.2-sol'
+)
+$ids = (Invoke-RestMethod -Uri 'http://127.0.0.1:4141/v1/models' -ErrorAction Stop).data.id
+$entries = foreach ($id in $ids) {
+  if ($id -notlike 'm365/*') { continue }
+  if ($id -in $longContext) { "${id}=1050000" } else { $id }
+}
+node scripts\codex-catalog.mjs --window=1000000 "--out=$HOME\.codex\m365-models.json" @entries
+```
+
+The script sets both `context_window` and `max_context_window`. Fully quit and reopen the Codex app
+to load the updated catalog. These values set Codex's context budget; they do not raise or measure
+the input limits enforced by M365 Copilot.
 
 ## 5. Claude Code
 

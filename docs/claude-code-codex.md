@@ -182,10 +182,10 @@ settings ([hypotheses §41](hypotheses.md)):
   (to a `codex…` User-Agent) with `m365/<id>` Code Mode entries, Claude included, windowed by each
   model's `contextWindow`. Its size limit can omit routable models, so use
   `node scripts/codex-catalog.mjs --all --out=~/.codex/m365-models.json` to discover every model from
-  `/v1/models` and fill missing entries from a Codex template. Alternatively, pass explicit model IDs
-  for a smaller picker. The script sets `context_window` and `max_context_window`; point a top-level
-  `model_catalog_json` at the output file. A top-level catalog applies
-  to every provider and overrides both discovery and `model_catalog_url` (F114).
+  `/v1/models` and fill missing entries from a Codex template. Use explicit `MODEL[=WINDOW]` arguments
+  for a smaller picker or [per-model context overrides](setup.md#long-context-catalog). The script sets
+  `context_window` and `max_context_window`; point a top-level `model_catalog_json` at the output file.
+  A top-level catalog applies to every provider and overrides both discovery and `model_catalog_url` (F114).
 - **One provider for every model.** The app saves the model you last picked as `model` in
   `config.toml`, without its provider. With a second provider, picking one of its models breaks new
   threads: copilot-api answers "This model does not support the responses endpoint". Put the other
