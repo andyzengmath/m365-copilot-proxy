@@ -119,9 +119,9 @@ vi.mock("@m365-copilot/core", async (importActual) => {
       super();
       this.mode = options.mode;
     }
-    override async run(text: string, model?: string, signal?: AbortSignal, useAgent?: boolean, images: string[] = [], waitForBudget?: () => Promise<unknown>, turn?: unknown) {
+    override async run(text: string, model?: string, signal?: AbortSignal, useAgent?: boolean, images: string[] = [], waitForBudget?: () => Promise<unknown>, turn?: { onReasoning?: (delta: string) => void }) {
       runtimeRuns.push({ mode: this.mode, model: model ?? "", useAgent, turn, text });
-      return Object.assign(await super.run(text, model, signal, useAgent, images, waitForBudget), { throttle: null, credits: 0.5, agentToolCalls: runtimeToolCalls });
+      return Object.assign(await super.run(text, model, signal, useAgent, images, waitForBudget, turn), { throttle: null, credits: 0.5, agentToolCalls: runtimeToolCalls });
     }
     close() { runtimeClosed.push(this.conversationId); }
   }
@@ -1550,6 +1550,29 @@ describe("Priority access (Opus 5.5, Sonnet 5.5): OutOfCredits, remembering it, 
     expect(Number(res.headers.get("Retry-After"))).toBeGreaterThan(0);
   });
 
+  it("reports the account's daily turns left in usage", async () => {
+    scripted.queue = [{ ...CALL, metering: { ...CALL.metering, TotalTurnUsageDaily: 7 } }];
+    const usage = (await (await send()).json()).usage;
+    expect(usage.x_m365_total_turns_daily_remaining).toBe(7);
+  });
+
+  it("429s the daily turn limit once for the whole account, with no fallback model", async () => {
+    process.env.M365_OPUS_FALLBACK_MODEL = "claude-opus-4.8";
+    const LIMIT = "You\u2019ve used your daily chat limit. Please try again tomorrow.";
+    scripted.queue = [{ fullText: LIMIT, result: { value: "OutOfCredits", message: LIMIT, errorCode: "TotalTurnDailyQuotaExhausted" } }];
+    const res = await send();
+    expect(res.status).toBe(429);
+    const err = (await res.json()).error;
+    expect(err.code).toBe("daily_turn_quota_exhausted");
+    expect(Number(res.headers.get("Retry-After"))).toBeGreaterThan(0);
+    expect(scripted.models).toEqual(["claude-opus"]); // no fallback turn
+    // Every chat model is refused alike, so the next request on another model stays local.
+    const next = await send("gpt-5.5", "another task");
+    expect(next.status).toBe(429);
+    expect((await next.json()).error.code).toBe("daily_turn_quota_exhausted");
+    expect(scripted.models).toEqual([]);
+  });
+
   it("then answers later metered Opus requests itself, without an M365 turn", async () => {
     scripted.queue = [REFUSAL];
     await send();
@@ -2851,6 +2874,19 @@ describe("the model's chain of thought as reasoning_content", () => {
     const call = deltas.findIndex((d) => d.tool_calls);
     expect(call).toBeGreaterThan(deltas.findIndex((d) => d.reasoning_content));
     expect(deltas.some((d) => d.content)).toBe(false);
+  });
+
+  it("streams a Cowork turn's steps, the tool calls of the runtime's own agent, as they start", async () => {
+    process.env.M365_BACKENDS = "chat,cowork";
+    try {
+      const steps = ["- web_search: Node.js LTS\n", "- Bash: Calculate the exact power of two\n"];
+      scripted.queue = [{ fullText: "Done.", reasoning: steps }];
+      const deltas = await deltasOf(await ask({ stream: true, model: "gpt-6.2-astra(cowork)" }));
+      expect(deltas.filter((d) => d.reasoning_content).map((d) => d.reasoning_content)).toEqual(steps);
+      expect(deltas.findIndex((d) => d.reasoning_content)).toBeLessThan(deltas.findIndex((d) => d.content));
+    } finally {
+      delete process.env.M365_BACKENDS;
+    }
   });
 
   it("returns it as message.reasoning_content when the request doesn't stream", async () => {

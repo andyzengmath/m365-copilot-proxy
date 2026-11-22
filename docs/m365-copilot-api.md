@@ -598,6 +598,84 @@ The final `type:2` frame carries the canonical state of the whole conversation i
 - This is why we **reuse one conversation** across an agent session and send **only new messages** on follow-up turns (delta mode) — every `Please continue.` retry also counts against the 600.
 - There is also opaque **account-level throttling** (rapid-fire requests can start returning empties). It recovers on its own.
 
+### 50 turns a day across the whole account: `TotalTurnUsageDaily` (2026-11-22)
+
+Every turn's `throttling.metering` map now carries **`TotalTurnUsageDaily`**. It reads 49 after the first turn of the UTC day and drops by exactly 1 per turn, whatever the model, agent or not, follow-up turns included. That makes it **50 turns a day per account**. It reset between 23:53Z and 01:11Z, which fits midnight UTC. On 2026-11-22 a bench took it from 49 to 0 between 01:11:18Z and 01:20:53Z, one turn every ~5 s. The next turn was refused like this:
+
+```json
+"result": { "value": "OutOfCredits", "message": "You've used your daily chat limit. Please try again tomorrow.",
+            "errorCode": "TotalTurnDailyQuotaExhausted", "creditScenario": "TotalTurn", "serviceVersion": "1.0.03611.67938" }
+```
+
+The reply comes from `contentOrigin: "BotConnection"` with `turnState: "Failed"`, the same shape as the priority-access wall, and the message names no reset time. This is not `PerUserThrottled` (that one clears in about an hour) and not priority access (that one is per model). Refusals ("no tool is available") showed up before the wall did.
+
+For an agent harness this is the binding limit: every tool step is a turn, so 50 is a few tasks a day. Since ba10843 the proxy handles it: the first refusal is remembered for the whole account, and every chat model gets a 429 `daily_turn_quota_exhausted` with `Retry-After` to midnight UTC, without an M365 turn and without falling back to another model (all of them are refused alike). `usage.x_m365_total_turns_daily_remaining` carries the counter on every answered turn. Image generation is not blocked, because it still works past the limit (below).
+
+The key wasn't in the log before 2026-11-21. The log doesn't go back far enough to say when Microsoft added it.
+
+### How the daily turn limit behaves (measured 2026-11-22)
+
+Data: `docs/quota/` (`direct.jsonl` for turns sent straight to M365, `sent.jsonl` for turns sent through the proxy, and the proxy log extracted with `scripts/quota-log.mjs`). Tooling: `scripts/quota-direct.mjs`, `scripts/quota-probe.sh`, `scripts/quota-day.sh`.
+
+**Cost per turn.** 49 consecutive think-deeper turns (01:11–01:21Z, prompts from 300 to 56,000 characters, first turns and follow-ups alike) each took the counter down by exactly 1. An image turn at 01:14Z (`tone: magic`, temporary chat, a `GraphicArt` result) cost **0** and moved no key, `ImageGeneration` (100) included. `ReasoningModelTurnUsage` stayed at 10 through all 49 reasoning turns, so this path doesn't spend it. The client knows an errorCode `ReasoningTurnExhausted` for it, which hasn't been seen yet.
+
+**What 0 refuses.** Every tone tried (`Gpt_5_5_Chat`, `Gpt_5_5_Reasoning`, `Gpt_5_4_Reasoning`, `Gpt_5_6_Reasoning`, `magic`), on Chathub, on StreamHub (included scenario; StreamHub carries no metering at all), and in the web UI. Claude (all tones) and GPT-6.x never reach the meter on this license: they come back `ForbiddenRequest` / `ClaudeUnavailableForLicense` / `PremiumModelUnavailableForLicense`, at any count.
+
+**Two kinds of refusal.**
+- *Fast* (~1.2 s): almost every refusal. The gate is checked before the model runs.
+- *Slow* (10–13 s): the turn right after the one that reached 0 (01:21Z), and one after 23 minutes of silence (01:44Z). The model ran and the turn was judged at the end.
+
+**Images get past it.** At 0, `/v1/images/generations` still produced and delivered the image (12:06Z). The `ImageGeneration` progress frame streams it, and only the final frame turns the turn into `Failed` / `OutOfCredits` / `TotalTurnDailyQuotaExhausted`. The proxy takes the image from the stream and returns 200.
+
+**The wall leaks about 8 %.** Of ~155 text turns the server judged at 0, **12 succeeded** with a normal answer and still reported `TotalTurnUsageDaily: 0`. A run of 120 fresh-conversation `Gpt_5_5_Chat` pongs, one a minute from 13:41Z to 15:41Z, got 10 passes, spread evenly (0–3 per 10 minutes). Passes take 3.5 s on average and refusals 1.8 s. The leak doesn't depend on:
+- the model or tone (`quick` and `gpt-5.5` send the same `Gpt_5_5_Chat` payload);
+- `isStartOfSession`;
+- new conversation or follow-up (one pass was turn 9 of a conversation with 8 refusals in it);
+- idle time (probes after 3, 5, 7, 10, 15, 20 and 30 minutes of silence were all refused).
+
+It looks like the gate failing open now and then. The proxy doesn't use it: hammering for a ~1-in-12 pass costs thread-rate budget (F58) and is working around the limit.
+
+**Web UI at 0.** The same refusal text, plus a card "**Upgrade to keep going** — You've reached your daily chat limit. Upgrade your plan to get more Copilot features and usage." with an Upgrade button. The client builds it from the final frame's `result.errorCode` (`TotalTurnDailyLimitUpsell`, behind the flag `enableTotalTurnDailyLimitUpsell`, AAD accounts only). No `MeteringInfo` frame, no `throttling.meteringLimitAlerts`. Adding the web client's opt-in variants `feature.EnableMeteringThrottleChatRequest` and `feature.EnableFreeMSA_AADUser100TurnLimit` to the WS query doesn't change the refusal.
+
+**Not this limit.** `PerUserThrottled` ("We're temporarily unable to respond to this volume of requests") is the thread-rate bucket of hypotheses §24 F58 (~100 turns, refilling ~1.6 a minute, then a ~1 h hold). All 25 occurrences in this proxy's log came in one burst on 2026-10-14 (11:28–12:01Z). None have come since.
+
+**Other limits the client knows about** (bundles from 2026-11-22). Upsell reasons: `MaxTotalTurn TotalTurnDailyLimit ReasoningTurnLimit ConversationTurnLimit MaxDailyUsage MaxPromptPerSession MaxCharactersPerQuery MaxOneFileUploadPerPrompt FileSizeLimit MaxGPTImageAnalysis MaxGPTImageAnalysisUpgrade`. Result codes: `TotalTurnDailyQuotaExhausted`, `ReasoningTurnExhausted`, `ConversationTurnLimitReached` (also `turns >= maxTurns` on the conversation), and `creditScenario` values `TotalTurn` and `ImageKnowledge` ("Max GPT Image analysis per account"). The flag `enableFreeAadUser100TurnLimit` adds the variant `feature.EnableFreeMSA_AADUser100TurnLimit`, which suggests a 100-turn per-conversation cap for free AAD users. The tenant's loki config has the consumptive-billing flags on (`PLGSDKConsumptiveBilling`, `EnableConsumptiveBillingCostCommand`, `EnableConsumptiveBillingCreditRequestScenarios`).
+
+**Still open** (day 2, `scripts/quota-day.sh`): the exact reset instant; what a cancelled turn, a license refusal, an oversize input, a web-UI turn, a StreamHub turn and a search turn cost; whether the web UI warns before 0; whether concurrent turns overshoot 0.
+
+### The API behind usage limits (2026-11-22)
+
+Found in the web client's bundles (all 2,356 rspack chunks, listed in `runtime.<hash>.js`, public on `res.public.onecdn.static.microsoft/midgard/versionless-v2/`). There are three channels. Only the first applies to this account.
+
+**1. In-band on the chat stream.** This is where the chat client reads limits. The client's parser (`meteringInfo` / `billing_info` handling in the Sydney client chunk) knows three frame kinds:
+- `throttling.metering`, every turn: `{<key>: {remainingAllowance}}`, as above. The full key list on 2026-11-22: `TenantDataAccess ImageAnalysis LLMOnly VisualCreator PersonalDataAccess GraphicArt CodeInterpreter FileReference DeepResearch CopilotTuning DeepWork WXPAgentMode NotebookCowork ImageGeneration ClaudeOpusQuery ClaudeOpusQuery75 ClaudeOpusQueryDev ClaudeOpusQueryC1 ClaudeOpusQueryC2 ClaudeOpusQueryDaily(…C1/C2) ClaudeOpusQueryHourlyDev ArtifactGeneration ReasoningModelTurnUsage ClaudeOpus(55)Query{Daily,Weekly}Word Gpt6Query{Daily,Weekly} GPT61SolQuery{Daily,Weekly}(Word) ClaudeSonnet55{Query,}{Daily,Weekly}(Word) TotalTurnUsageDaily GPT62SolQuery{Daily,Weekly}(Word) GPT62AstraQuery{Daily,Weekly}(Word) CostQuota`.
+- A `MeteringInfo` message carrying `meteringInfo: {meterError, meteredResource, hasAccess, remainingAllowance, totalAllowance, resetAt, serviceName, meteredModelInfo.modelId}`. The client shows its "limit reached" banners from this, behind the flag `enableMainlineDaybreakMeteringInfoBanners`. The enums are `meteredResource` ∈ `CostQuota TenantDataAccess ImageAnalysis LLMOnly VisualCreator PersonalDataAccess GraphicArt CodeInterpreter ClaudeOpusQuery FileReference VoiceRealTime VisionRealTime DeepResearch CopilotTuning DeepWork WXPAgentMode NotebookCowork ModelUsage ImageUpload AICredits` and `meterError` ∈ `None Limit Billing ImageGenInsufficientTokensThrottled`. The banner kinds are `ModelUsage` (a per-model limit), `CostQuota` and `ImageCapacity`. None has turned up in this proxy's logs yet.
+- A `billing_info` frame (StreamHub persistent stream) carrying `billingInfo: {usageBasedBillingUtilizationPercentage (-1..100), usageBasedBillingResetOn, serviceMeterName, status: creditInUse|creditNotInUse|outOfCredit}`, plus a `cost_info` frame. These feed the header's `creditStatus` meter, behind `enableUbbUsageState` / `enableAadUbbCreditBanners`. The model picker's options carry the same fields (`usageBasedBillingEnabled`, `usageBasedBillingUtilizationPercentage`) when a model is billed by usage.
+
+**2. AI-credits entitlement, GraphQL on `loki.delve.office.com/api/v2/graphql/`.** The request is a POST with `ConvertSimpleRequest=POST`; the auth headers go in the JSON body as `__request_headers`, not as real headers. The client sends `fetchAiCreditsQuery`:
+```graphql
+viewer { aiCredits {
+  evaluateAiCredits(input: {evaluationTypes: ["Usl","Capacity"], entitlements: ["AICredits"], context: {services: $services, operationType: "OR"}}) {
+    entitlements { hasAccess serviceName availableQuantity entitledQuantity uslDetails{evaluationResult licenseId} capacityDetails{billingPlanId evaluationResult billingPolicyEvaluationResult} } }
+  creditRequests { requestId state approvedCredits … } } }
+```
+Valid services: `PremiumModelsInM365Chat`, `M365CopilotChatAdvancedWork`, `ResearcherCritiqueAndCouncil`. A wrong service name gives "Neptune request failed". There are also mutations `creditRequestCreate` / `creditRequestUpdate` (asking the admin for more credits). On this account all three services return `hasAccess:false`, 0/0, USL `Skipped` and Capacity `Skipped`, which the client maps to `NotConfigured`: the tenant has no AI-credits plan. The same endpoint serves `PLGEnvironmentQuery` (upsell scenarios).
+
+**3. Cowork v2 ("Aether") REST**, base `aether-*.microsoft.com/api` or a routed `*.island.powerapps.com` gateway: `GET /users/me/cost` and `GET /users/me/creditRequest`, next to `/v1/tasks`, `/conversations` and `/projects`. That's Cowork's agentic billing, not chat.
+
+To call #2: take the `__request_headers` from the app's own `PLGEnvironmentQuery` POST, swap in the query and variables, and post to the same URL. It's read-only and costs no chat turn.
+
+### What the web UI shows about usage (2026-11-22, a Basic account)
+
+Read-only look at copilot.cloud.microsoft, no chat sent. The plan label under the account name reads **"M365 Copilot (Basic)"**, and its info tooltip says "Availability may be limited during peak demand." That is all there is: **no usage meter**, nothing in the model picker (Auto / Quick response / Think deeper / GPT ▸) and no usage page in Settings. The `PLGEnvironmentQuery` call (loki.delve.office.com) asks for the scenarios `ImageLimitsCapacityUpsell` and `ImageLimitsDailyLimitUpsell` but only gets an "Upgrade" button back, so the image-limit UI seems to show up only once a limit is hit.
+
+Microsoft has built a full meter UI, though. It's in the PLG SDK strings (`res.public.onecdn.static.microsoft/midgard/versionless-v2/plg-sdk-ui-strings/en-gb.<hash>.json`, 354 keys) and is waiting for a plan that turns it on:
+
+- **Consumer tier:** a *weekly AI limit*. There's a banner ("{0} of weekly AI limit remaining", "Weekly AI limit reached"), the fallback "continue with Copilot Chat until your limit resets on {0}", and Copilot Credits that take over once the limit is used up.
+- **Org tier (`consumptiveBilling`):** *monthly credits* set by an admin, per user or as a shared group pool. There are banners at 50% and 20% remaining, "{n} credits used for this chat", and a "Usage" dialog with a meter ("Your usage limit" / "Shared usage pool"), a daily bar chart of credits spent, and credits broken down by use case, chat, task and session. It covers Chat ("Advanced models in Chat"), Code, Cowork and Autopilot. "Limits reset on {0}" is the first of the month.
+
+None of those strings is "daily chat limit"; that text comes from the server. Watch for the **Usage dialog or credit banner appearing on this account**: it would mean the tenant moved onto metered credits, and the turn-count assumptions above stop holding.
+
 ### Account degradation under sustained use (observed June 13 2026)
 
 A full session of heavy use (~80+ messages across probes, bench runs, and logins
@@ -1048,7 +1126,10 @@ the proxy continues advertising Cowork/Code as text-only until that adapter is i
 | `cq` | `{d, m, t, r}`: a charge, `d` Copilot credits for model `m` on message `r`. `t` is the message ID for the title call and the run's own ID for the model's calls; the run's charge lands within milliseconds of `rl ok`, before or after it |
 | `error` | `{code, err, retry, sev}`, e.g. `engine.v2_refusal` "This request couldn't be completed. Please send your message again." |
 | `uq` | `{b, r, k, rs}`: the monthly entitlement, after `rl` |
-| `ti`, `tk`, `ic`, `tst`, `co`, `ck`, `rh`, `rpc`, `cs`, `up` | title, task progress and the rest; the proxy ignores them |
+| `ts` | `{tid, tn, d, inp, it}`: the runtime's agent starts a tool call of its own: `tn` the tool (`mcp__core__web_search`, `mcp__core__web_fetch`, `Bash`, …), `d` what it's for (the query, the URL, a command's description), `inp` its JSON input. The proxy sends `tn` (prefix dropped) and `d` to the client as a `reasoning_content` line, from this run's `rl started` on |
+| `tx` | `{tid, tn, dur, ok, d, wr}`: that call ended; `wr` holds a web call's results |
+| `tho` | `{kind: "tool_call", tool}`: just ahead of a `ts` |
+| `ti`, `tk`, `ic`, `tst`, `co`, `ck`, `rh`, `rpc`, `cs`, `up`, `ci`, `cv` | title, task progress, citations and the rest; the proxy ignores them |
 
 **Other calls.** `GET /v1/models`: the catalog, the same for both tabs (`supported_effort_levels`,
 `usage_multiplier`, `llm_health_bucket`). It changes: on Nov 19 2026 it listed eight models in the
