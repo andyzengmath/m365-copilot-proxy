@@ -105,9 +105,12 @@ hypothesis that teaches us something.
   probe saves or prints: the variable changes it without a change to the probe.
   A probe that sets its own scenario, `variants` or `streamingMode` sends the
   proxy's values over StreamHub (`getStreamHubScenario()`, `streamhub11`,
-  `ConciseV2`): the proxy doesn't use Chathub's included/paid split there. A non-premium account is
-  refused under that pair (`officeweb`, `InvalidCopilotLicense`): there, run StreamHub probes with
-  `M365_SCENARIO=OfficeWebIncludedCopilot`, which the helper's own default reads too.
+  `ConciseV2`): the proxy doesn't use Chathub's included/paid split there. A non-premium account gets
+  no answer under that pair (`officeweb`): since Nov 23 2026 a tone without its own licence gate gets
+  an empty `Success` turn, which the proxy answers with a 502 `scenario_not_served`, and a Claude or
+  GPT-6.x tone gets its model refusal (`InvalidCopilotLicense` before, docs/hypotheses.md §61 F170).
+  There, run StreamHub probes with `M365_SCENARIO=OfficeWebIncludedCopilot`, which the helper's own
+  default reads too.
 - **Quantify with the benchmark** — `scripts/bench/` (Terminal-Bench-style) scores
   real agentic coding tasks objectively, executing every tool call in a
   `--network none` Docker sandbox. To compare *any* lever (tool format, model/tone,
@@ -150,9 +153,10 @@ pnpm test:live      # M365_LIVE=1; live tests that hit real M365 (uses quota)
 - **Run inside the Nix dev shell**: `nix develop --command bash -c '...'`. It provides
   `CHROMIUM_PATH` (a system Chromium; Playwright's bundled one is broken on NixOS), pi, python3
   and curl. Run the bench scripts in it too: `nix develop --command bash scripts/bench/phase-sweep.sh`.
-- Auth uses `~/.config/opencode-m365/secrets.json` (email/password/mfaSecret) +
-  `msal-cache.json`. **This data dir keeps the legacy `opencode-m365` name** — do not
-  rename it or you orphan working credentials.
+- Auth uses `~/.config/opencode-m365/secrets.json` (email/password/mfaSecret, plus an optional
+  client certificate: `clientCertPath`/`clientCertPassword`, README step 2) + `msal-cache.json`.
+  **This data dir keeps the legacy `opencode-m365` name** — do not rename it or you orphan
+  working credentials.
 - Set `M365_DEBUG=1` to log to `~/.config/opencode-m365/debug.log` (`M365_LOG_FILE` renames it and
   `M365_FRAME_DIR` moves the `M365_DUMP_FRAMES` dumps, both relative to that directory). There is **no
   interactive login** — auth is silent-refresh → automated (secrets.json) → fail loudly.
@@ -205,6 +209,8 @@ pnpm test:live      # M365_LIVE=1; live tests that hit real M365 (uses quota)
   `content` beside the call, Codex's commentary (`M365_NO_NARRATION=1` off); text after the block is
   stripped, since it's written before the call ran (§60 F165). The relays ask for the block alone, so
   GPT-6.2 Sol rarely writes any; `M365_NARRATE=sentence|comment` asks for it (off by default, §60 F166).
+  M365's citation links are dropped from it, and after a re-ask for a damaged or unreadable call it is the
+  first reply's text, not the re-ask's answer ("Resending with…", §64 F181).
 - **`claude-opus` is entitlement-gated and separately metered.** The WS `scenario` decides which
   model serves: `Claude_Opus` is Opus 5.5 on `OfficeWebPaidCopilot` and another model, Opus 4.8 (below), on
   `OfficeWebIncludedCopilot` (`getScenarioForModel`, derived per-turn from the model ID).
@@ -238,6 +244,19 @@ pnpm test:live      # M365_LIVE=1; live tests that hit real M365 (uses quota)
   as you can into one block" cut turns per task 37% (F60), which is what Opus 5.5's budget counts. Opus 4.5 sometimes ended a tool fence with its native call
   markup (`</invoke>`, `</parameter>`…); the parser strips it (F57), on its own line or glued to the last one (Sonnet 5.5 too), don't "simplify" that away. A call the model writes again as a correction ("Oops… here is the same command") replaces the first copy rather than counting as two. Only a premium account can
   bench it. See docs/hypotheses.md §24, §36.
+- **`claude-auto` (`Claude_Auto`) answers as Opus 5.5, and M365 doesn't charge its StreamHub turns to
+  Opus's budget.** The tone self-IDs as Opus 5.5 on the paid scenario. Over Chathub's paid scenario each
+  turn lowers `ClaudeOpusQuery*` by 1, as `Claude_Opus` does; over StreamHub it lowered nothing (0 of 47
+  turns, 37 of them through the proxy), while StreamHub's `Claude_Opus` and `Claude_Sonnet` turns still
+  spent their budgets (7 of 7, 3 of 3).
+  StreamHub reports no `metering`, so the allowances were read with Chathub paid-scenario turns before
+  and after (`scripts/metering-probe.mjs`). So `claude-auto` is sent over StreamHub whatever
+  `M365_TRANSPORT` says (`STREAMHUB_MODELS`, `getTransportForModel`), under the paid scenario
+  (`PAID_SCENARIO_TONES`), agent-less, and isn't in `meteredBudgetOf`. Don't route it over Chathub.
+  The web client's own "Opus 5.5" item sends `Claude_Opus`, and its selector has no `Claude_Auto` item
+  (F177; `scripts/chathub-tones.mjs` lists the selector's items with no chat turn, F178). Microsoft can
+  start charging these turns at any time without notice: re-run the probe before relying on it. See
+  docs/hypotheses.md §62.
 - **Entitlement-gated ≠ metered.** `gpt-6-think-deeper` (`Gpt_6_Reasoning`) and `claude-sonnet-5`
   (`Claude_Sonnet_5`) need the same paid
   scenario as Opus but carry **no** priority-access budget and throttle like everything else,
@@ -342,6 +361,13 @@ pnpm test:live      # M365_LIVE=1; live tests that hit real M365 (uses quota)
   agent route, which has no text. The live stream holds the text back. `usage`
   carries estimated tokens (4 UTF-8 bytes a token; `M365_REPORT_USAGE=0` for zeros), so a client sees its
   context fill and compacts.
+- **An empty `Success` off the included scenario is the account's licence, not a transient.** Under
+  `officeweb` or the paid scenario a non-premium account gets `Success`, no text and only an EarlyProgress
+  message for a model without its own licence gate, every time (docs/hypotheses.md §61 F170, F171).
+  `progressOnlyTurn` in `handler.ts` stops there with a 502 `scenario_not_served` that names
+  `M365_SCENARIO`. Don't send it down the empty-reply retries, and don't count it with `noteOutcome(true)`:
+  it isn't the thread-rate throttle. The empty-reply path re-checks the tool agent only for a turn that
+  carried it (#150).
 - **Cowork and Code are another service, and every turn there costs credits.** A model ID with `(cowork)` or
   `(code)` (`<model>(<backend>)[_<window>][_credit]`, `core/src/backends.ts`) runs on Copilot's agent
   runtime (`aether.ts`, API doc §14), not Chat, when `M365_BACKENDS` lists the backend (all three by

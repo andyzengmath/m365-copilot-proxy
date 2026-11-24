@@ -71,6 +71,16 @@ const MODEL_TONES: Record<string, string> = {
   "claude-opus-4.8": "Claude_Opus",
   "claude-opus-4.5": "Claude_Opus",
 
+  // `Claude_Auto`: Opus 5.5 by self-ID on the paid scenario ("Claude Opus 5.5",
+  // cutoff 2026-06, with chain-of-thought summaries as `Claude_Opus` sends; on
+  // the included scenario it self-IDs as a GPT model). Over Chathub's paid
+  // scenario each turn spends Opus's priority-access budget, as `Claude_Opus`
+  // does; over StreamHub's paid scenario it spends none (docs §62). So
+  // `claude-auto` goes over StreamHub whatever M365_TRANSPORT says
+  // (STREAMHUB_MODELS), under the paid scenario (PAID_SCENARIO_TONES), and
+  // agent-less, as every StreamHub turn.
+  "claude-auto": "Claude_Auto",
+
   // GPT-5.5 (current generation)
   "gpt-5.5": "Gpt_5_5_Chat",
   "gpt-5.5-quick": "Gpt_5_5_Chat",
@@ -113,8 +123,11 @@ const MODEL_TONES: Record<string, string> = {
   // the included scenario on premium and non-premium accounts alike (#23,
   // tone-probe 2026-10-02, 4/4 + 2/2), so it stays out of PAID_SCENARIO_TONES.
   // What depends on the account is the tool agent — see
-  // PREMIUM_ONLY_AGENT_TONES. `Gpt_6_Sol_Chat` is accepted too but self-IDs
-  // as the GPT-5 chat model on both accounts, agent or not, so it isn't mapped.
+  // PREMIUM_ONLY_AGENT_TONES. `Gpt_6_Sol_Chat` is accepted too and unmapped: on
+  // the included scenario it self-IDs as the GPT-5 chat model on both accounts,
+  // agent or not; on the paid scenario and over StreamHub's `officeweb` it
+  // self-IDs as GPT-6 reasoning, and the web client's "GPT-6" item sends it
+  // (docs §63 F179, F180, H63a).
   "gpt-6-sol": "Gpt_6_Sol_Reasoning",
 
   // GPT-6.1 Sol ("GPT-6.1 Sol" in the web client). Routed like GPT-6 Sol: the
@@ -249,12 +262,17 @@ const PAID_LICENSE_TYPE = "Premium";
  * `Gpt_6_Astra_Reasoning` is here for `Gpt_6_Reasoning`'s reason: the included
  * scenario answers with the BotConnection apology, the paid one serves
  * (2026-11-18, docs §45 F121).
+ *
+ * `Claude_Auto` is here for `Claude_Sonnet_5`'s reason: the model it names,
+ * Opus 5.5, answers on the paid scenario, and on the included one the tone
+ * self-IDs as a GPT model, which nothing should map (docs §62).
  */
 export const PAID_SCENARIO_TONES: ReadonlySet<string> = new Set([
   "Claude_Opus",
   "Claude_Sonnet_5",
   "Gpt_6_Reasoning",
   "Gpt_6_Astra_Reasoning",
+  "Claude_Auto",
 ]);
 
 /**
@@ -463,7 +481,7 @@ export function toolRequestUsesAgent(tone: string): boolean {
  */
 export function requestUsesAgent(model: string, hasTools: boolean): boolean {
   // The StreamHub transport carries no declarative agent (session.ts).
-  if (getTransport() === "streamhub") return false;
+  if (getTransportForModel(model) === "streamhub") return false;
   return hasTools && toolRequestUsesAgent(getToneForModel(model));
 }
 
@@ -523,6 +541,23 @@ export function getTransport(): Transport {
 }
 
 /**
+ * Model IDs whose turns go over StreamHub whatever M365_TRANSPORT says, under
+ * their own scenario (getScenarioForModel), not StreamHub's `officeweb`.
+ *
+ * `claude-auto` (`Claude_Auto`, Opus 5.5 by self-ID): over Chathub's paid
+ * scenario each turn spends Opus's priority-access budget, as `claude-opus`
+ * does; over StreamHub's paid scenario it spends none (docs §62).
+ */
+export const STREAMHUB_MODELS: ReadonlySet<string> = new Set([
+  "claude-auto",
+]);
+
+/** The transport this model's turns travel on: StreamHub for STREAMHUB_MODELS, else getTransport. */
+export function getTransportForModel(model: string): Transport {
+  return STREAMHUB_MODELS.has(model) ? "streamhub" : getTransport();
+}
+
+/**
  * The `scenario`/`licenseType` pair for a StreamHub turn: the new web client's
  * own, `officeweb` + `Premium`, for every model. The Chathub-era scenarios
  * don't carry over: under `OfficeWebIncludedCopilot` StreamHub refuses GPT-6.1
@@ -536,6 +571,22 @@ export function getStreamHubScenario(): ScenarioRouting {
     scenario: process.env.M365_SCENARIO ?? "officeweb",
     licenseType: process.env.M365_LICENSE_TYPE ?? PAID_LICENSE_TYPE,
   };
+}
+
+/** The included scenario: the one a non-premium account is served under. */
+export const INCLUDED_SCENARIO = DEFAULT_SCENARIO;
+
+/**
+ * The transport and `scenario`/`licenseType` pair a turn for this model goes
+ * out under: StreamHub's pair (`getStreamHubScenario`) under
+ * `M365_TRANSPORT=streamhub`, the model's own (`getScenarioForModel`) on
+ * Chathub. A model in STREAMHUB_MODELS goes over StreamHub under its own pair,
+ * whatever the variable says. The session logs it as its "Routing:" line.
+ */
+export function getTurnRouting(model: string): ScenarioRouting & { transport: Transport } {
+  if (STREAMHUB_MODELS.has(model)) return { transport: "streamhub", ...getScenarioForModel(model) };
+  const transport = getTransport();
+  return { transport, ...(transport === "streamhub" ? getStreamHubScenario() : getScenarioForModel(model)) };
 }
 
 /**

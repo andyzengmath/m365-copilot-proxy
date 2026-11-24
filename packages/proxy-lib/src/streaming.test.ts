@@ -41,7 +41,9 @@ const scripted: {
   partQueue: Array<{ fullText: string; messageType?: string | null; contentOrigin?: string; apology?: boolean; result?: { value: string; errorCode?: string; message?: string }; throttle?: { current: number; max: number } | null; turnState?: string; reasoning?: string[] }>;
   /** The chain of thought a turn without a queue entry hands to `onReasoning`, piece by piece. */
   reasoning: string[];
-} = { reasoning: [], deltas: [], runs: 0, texts: [], queue: [], agentFlags: [], newConversations: 0, models: [], images: [], gate: null, signals: [], stoppedAfter: null, budgetHold: null, awaitTurnBudgetCalls: [], budgetWaits: [], convs: [], ids: 0, partQueue: [] };
+  /** How many times the handler re-checked the tool agent (refreshAgent). */
+  refreshAgents: number;
+} = { reasoning: [], deltas: [], runs: 0, texts: [], queue: [], agentFlags: [], newConversations: 0, models: [], images: [], gate: null, signals: [], stoppedAfter: null, budgetHold: null, awaitTurnBudgetCalls: [], budgetWaits: [], convs: [], ids: 0, partQueue: [], refreshAgents: 0 };
 
 vi.mock("@m365-copilot/core", async (importActual) => {
   const actual = await importActual<typeof import("@m365-copilot/core")>();
@@ -52,7 +54,7 @@ vi.mock("@m365-copilot/core", async (importActual) => {
     conversationId = `conv-${++scripted.ids}`;
     reset() {}
     newConversation() { this.conversationId = `conv-${++scripted.ids}`; this.turnCount = 0; scripted.newConversations++; }
-    async refreshAgent() { return false; }
+    async refreshAgent() { scripted.refreshAgents++; return false; }
     async run(text: string, model?: string, signal?: AbortSignal, useAgent?: boolean, images: string[] = [], waitForBudget?: () => Promise<unknown>, turn?: { onReasoning?: (delta: string) => void }) {
       if (scripted.gate) await scripted.gate;
       scripted.budgetWaits.push(waitForBudget);
@@ -139,7 +141,7 @@ const runtimeClosed: string[] = [];
 const servedBy: number[] = [];
 
 const { handleChatCompletion, SessionPool, ChatCompletionRequest } = await import("./index.js");
-const { resetAgentRoutes, resetPriorityAccessState, noteRequestOutcome, TurnBudgetHold, noteWebSearchOverflow, toneUsesWebSearch, resetWebSearchOverflow } = await import("@m365-copilot/core");
+const { resetAgentRoutes, resetPriorityAccessState, noteRequestOutcome, isDegradationBackoff, TurnBudgetHold, noteWebSearchOverflow, toneUsesWebSearch, resetWebSearchOverflow } = await import("@m365-copilot/core");
 
 // The proxy remembers a priority-access wall and degradation backoff for the
 // process; reset both between tests so one test's refusal/throttle doesn't
@@ -331,6 +333,11 @@ describe("a tool call the proxy can't read", () => {
     expect(JSON.parse(msg.tool_calls[0].function.arguments)).toEqual({ command: "ls -la" });
     expect(scripted.texts).toHaveLength(2);
     expect(scripted.texts[1]).toContain("couldn't be read as a tool call — its closing ``` never came on a line of its own");
+  });
+
+  it("says beside that call what the first reply said, not its answer to the re-ask (§64 F181)", async () => {
+    const msg = await ask([UNCLOSED, "Here it is again, closed.\n```bash\nls -la\n```"]);
+    expect(msg.content).toBe("Let me look at the files.");
   });
 
   it("asks once: a second unreadable reply goes out as text", async () => {
@@ -944,6 +951,7 @@ describe("follow-up turns and give-ups (Windows / pi, measured)", () => {
     const m = await ask([{ role: "user", content: `pdf ${Math.random()}` }], new SessionPool());
     expect(scripted.texts).toHaveLength(2); // the forcing retry ran
     expect(m.tool_calls?.[0] && JSON.parse(m.tool_calls[0].function.arguments).command).toBe("ls -la");
+    expect(m.content).toBeNull(); // the give-up isn't the call's commentary
     scripted.queue = [];
   });
 
@@ -1504,6 +1512,98 @@ describe("Opus 4.8 on an account that can't serve it (§24, §36)", () => {
   });
 });
 
+describe("A scenario the account isn't licensed for: a progress line and nothing else (#150)", () => {
+  // What a non-premium account gets for an ungated model under `officeweb` or the
+  // paid scenario: `Success`, no text, an EarlyProgress message (hypotheses §61 F170).
+  const PROGRESS_ONLY = { fullText: "", contentOrigin: "EarlyProgress", messageType: "Progress" };
+  const tools = [{ type: "function", function: { name: "bash", parameters: { type: "object", properties: { command: { type: "string" } } } } }];
+  const ENV = ["M365_TRANSPORT", "M365_SCENARIO", "M365_NO_BACKOFF", "M365_NO_AUTO_REAUTH"] as const;
+  const saved = Object.fromEntries(ENV.map((k) => [k, process.env[k]]));
+
+  beforeEach(() => {
+    for (const k of ENV) delete process.env[k]; // the backoff must be live to show it isn't started
+    scripted.refreshAgents = 0;
+  });
+  afterEach(() => {
+    for (const k of ENV) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+    scripted.queue = [];
+    noteRequestOutcome(false, "");
+  });
+
+  async function send(model: string, { stream = false, withTools = false } = {}) {
+    scripted.result = null;
+    scripted.models = [];
+    scripted.agentFlags = [];
+    scripted.queue = [PROGRESS_ONLY, PROGRESS_ONLY, PROGRESS_ONLY];
+    return respond(ChatCompletionRequest.parse({
+      model, stream, ...(withTools ? { tools } : {}),
+      messages: [{ role: "user", content: `hello ${Math.random()}` }],
+    }));
+  }
+
+  it("stops after one turn over StreamHub's default scenario, says what to set, and doesn't start the throttle backoff", async () => {
+    process.env.M365_TRANSPORT = "streamhub";
+    for (let i = 0; i < 3; i++) {
+      const res = await send("gpt-5.5");
+      expect(res.status).toBe(502);
+      const err = (await res.json()).error;
+      expect(err.code).toBe("scenario_not_served");
+      expect(err.message).toContain("under the officeweb scenario over StreamHub");
+      expect(err.message).toContain("M365_SCENARIO=OfficeWebIncludedCopilot");
+      expect(scripted.models).toEqual(["gpt-5.5"]);
+    }
+    expect(scripted.refreshAgents).toBe(0);
+    expect(isDegradationBackoff()).toBe(false);
+  });
+
+  it("…a tool request over StreamHub too, which never carries the agent there", async () => {
+    process.env.M365_TRANSPORT = "streamhub";
+    const res = await send("gpt-5.5", { withTools: true });
+    expect((await res.json()).error.code).toBe("scenario_not_served");
+    expect(scripted.agentFlags).toEqual([false]);
+  });
+
+  it("streams it as an error chunk", async () => {
+    process.env.M365_TRANSPORT = "streamhub";
+    const res = await send("m365-copilot", { stream: true });
+    expect(res.status).toBe(200);
+    const raw = await res.text();
+    const chunks = raw.split("\n").filter((l) => l.startsWith("data: ") && l !== "data: [DONE]").map((l) => JSON.parse(l.slice(6)));
+    expect(chunks.find((c) => c.error)?.error.code).toBe("scenario_not_served");
+    expect(scripted.models).toEqual(["m365-copilot"]);
+  });
+
+  it("does the same over Chathub when M365_SCENARIO names a scenario other than the included one", async () => {
+    process.env.M365_SCENARIO = "OfficeWebPaidCopilot";
+    const err = (await (await send("gpt-5.6")).json()).error;
+    expect(err.code).toBe("scenario_not_served");
+    expect(err.message).toContain("under the OfficeWebPaidCopilot scenario over Chathub");
+    expect(scripted.models).toEqual(["gpt-5.6"]);
+  });
+
+  it("keeps the empty-reply retries under the included scenario, and re-checks no agent for an agent-less request", async () => {
+    for (let i = 0; i < 3; i++) {
+      const res = await send("gpt-5.5");
+      expect((await res.json()).error.type).toBe("upstream_empty_response");
+      expect(scripted.models).toHaveLength(3);
+    }
+    expect(scripted.refreshAgents).toBe(0);
+    // The control: on this path three empty conversations do start the backoff.
+    expect(isDegradationBackoff()).toBe(true);
+  });
+
+  it("leaves a request that carries the agent on the empty-reply path, with its one agent re-check", async () => {
+    process.env.M365_SCENARIO = "officeweb";
+    const res = await send("gpt-5.5", { withTools: true });
+    expect((await res.json()).error.type).toBe("upstream_empty_response");
+    expect(scripted.agentFlags).toEqual([true, true, true]);
+    expect(scripted.refreshAgents).toBe(1);
+  });
+});
+
 describe("Priority access (Opus 5.5, Sonnet 5.5): OutOfCredits, remembering it, metering, the opt-in fallback (#18)", () => {
   const tools = [{ type: "function", function: { name: "bash", parameters: { type: "object", properties: { command: { type: "string" } } } } }];
   const WEEKLY = "You\u2019ve used your available priority access to the Opus model for the week. You can choose another available model or wait until Monday to use the Opus model again.";
@@ -1571,6 +1671,19 @@ describe("Priority access (Opus 5.5, Sonnet 5.5): OutOfCredits, remembering it, 
     expect(next.status).toBe(429);
     expect((await next.json()).error.code).toBe("daily_turn_quota_exhausted");
     expect(scripted.models).toEqual([]);
+  });
+
+  it("doesn't take an answer that quotes the daily-limit refusal for the refusal", async () => {
+    const LIMIT = "You\u2019ve used your daily chat limit. Please try again tomorrow.";
+    const quoting = "```bash\necho \"" + LIMIT + "\"\n```";
+    scripted.queue = [{ fullText: quoting, result: { value: "Success", message: quoting } }, CALL];
+    const res = await send("gpt-5.5");
+    expect(res.status).toBe(200);
+    expect((await res.json()).choices[0].message.tool_calls).toHaveLength(1);
+    // Nothing was remembered: the next request still reaches M365.
+    const next = await send("gpt-5.5", "another task");
+    expect(next.status).toBe(200);
+    expect(scripted.models).toEqual(["gpt-5.5"]);
   });
 
   it("then answers later metered Opus requests itself, without an M365 turn", async () => {
@@ -2010,6 +2123,12 @@ describe("a PowerShell command that lost a [Type]: to M365's post-processing (§
     expect(res.status).toBe(502);
     expect((await res.json()).error.type).toBe("damaged_tool_call");
     expect(scripted.runs).toBe(2);
+  });
+
+  it("says beside the re-sent call what the first reply said, not its answer to the proxy (§64 F181)", async () => {
+    scripted.queue = [{ fullText: `I'll set the port to 8080.\n\n${damaged}` }, { fullText: `Resending with the full .NET type name.\n\n${whole}` }];
+    const res = await ask();
+    expect((await res.json()).choices[0].message.content).toBe("I'll set the port to 8080.");
   });
 
   it("leaves an intact static call alone", async () => {

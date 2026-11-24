@@ -25,7 +25,7 @@ If you read nothing else:
 6. Auth uses **MSAL PKCE with the `nativeclient` redirect**, which a real browser bounces to `/common/wrongplace` — you must scrape the auth code from the *navigation request*, not wait for the redirect to land.
 7. **Tool calling is not native.** It only works reliably if you create a **Copilot Studio agent** and reference it per request; otherwise M365 ignores tool instructions and answers in prose / hallucinates.
 8. M365 has a **"Disengaged" safety filter**: large or jailbreak-looking prompts get a `messageType:"Disengaged"` message with **empty content** — which is easy to mistake for rate limiting.
-9. The **new web client (`copilot.cloud.microsoft`) uses StreamHub**, a second endpoint with the same SignalR protocol but item-based framing; `M365_TRANSPORT=streamhub` makes the proxy use it (§13).
+9. The **new web client (`copilot.cloud.microsoft`) uses StreamHub**, a second endpoint with the same SignalR protocol but item-based framing; `M365_TRANSPORT=streamhub` makes the proxy use it (§13). Not every user gets the new client: some users' client at the same address still uses Chathub.
 10. The web app's **Cowork and Code tabs are a different service**: an agent runtime with a REST + SSE API, its own token scope, longer turns (2M characters on GPT) and a charge in Copilot credits on every turn. The proxy's `cowork` and `code` backends use it (§14).
 
 ---
@@ -139,6 +139,26 @@ history tests do not establish compatibility with every live Edge profile or ten
 - Field selectors: email `input[name="loginfmt"]`, password `input[name="passwd"]`, TOTP `input[name="otc"]`.
 - On NixOS, Playwright's bundled `chrome-headless-shell` fails (`libglib-2.0.so.0`); point it at a system Chromium via `CHROMIUM_PATH` (`resolveChromiumPath()`).
 - TOTP codes are single-use per 30s window — space retries past the window.
+- **Client certificates.** With `clientCertPath` (and `clientCertPassword`) in `secrets.json`, both
+  Playwright logins pass the PKCS#12 bundle as Playwright's `clientCertificates` for
+  `https://certauth.login.microsoftonline.com`, `https://certauth.login.microsoftonline.us` and
+  `https://device.login.microsoftonline.com` (`CLIENT_CERT_ORIGINS`, `client-cert.ts`). Which of them asks
+  for it depends on the tenant. Playwright implements the option with a local SOCKS proxy: all of the
+  login browser's traffic goes through it, Node makes each TLS connection and presents the certificate to
+  an origin that asks for one, and Chromium is told to accept the proxy's own certificate. So the servers
+  see Node's TLS handshake, not Chromium's. `DEBUG=pw:client-certificates` logs each connection the proxy
+  makes.
+- **A device certificate needs a macOS or Windows user agent.** For a Linux user agent Entra's sign-in page
+  config says `sDevicePlatformForUi: "Linux"` and `sDeviceState: "Unregistered"`, and Entra doesn't ask for
+  the certificate, so a policy that requires a registered device refuses the sign-in. Set `M365_LOGIN_UA` to
+  a macOS or Windows Chrome user agent. Playwright derives the client hints (`Sec-CH-UA-Platform`) from it;
+  `navigator.platform` keeps the real value. A token from a sign-in that presented a device certificate
+  carries the device's ID in its `deviceid` claim.
+- **An OAuth error ends the login at once.** The `nativeclient` redirect can carry `error`, `error_subcode`
+  and `error_description` instead of a code (a Conditional Access block, a cancel). The login fails with
+  them right away (`nativeclientRedirectCode()`, `login-page.ts`) instead of waiting for its 45 s
+  timeout. With `M365_DEBUG=1` the log also lists each page the login browser loads (`Login page:`, origin
+  and path only, since the query strings carry the OAuth state, the code and the login hint).
 - **Managed Windows PCs (Entra-joined, Intune) can sign in silently with Chrome.** With the Chrome
   policy `CloudAPAuthEnabled=1`, Chrome signs in with the Windows PRT. The interactive path
   (`M365_ENABLE_INTERACTIVE_APPROVAL=1`, `CHROMIUM_PATH` set to chrome.exe, a Windows
@@ -274,13 +294,14 @@ There is no `model` parameter. The `tone` string on the chat message picks the m
 | `claude-sonnet-think-deeper` | `Claude_Sonnet_Reasoning` | Claude Sonnet + reasoning (included scenario; not re-identified since 4.5) |
 | `claude-opus` / `claude-opus-5.5` / `claude-opus-5` | `Claude_Opus` **+ paid scenario** | **real Opus — Claude Opus 5.5** (self-IDs "Claude Opus 5.5", cutoff 2026-06, since at least 2026-10-01; it was Opus 5, cutoff 2026-05, in September — `claude-opus-5` is kept as an alias). Reachable ONLY under `scenario=OfficeWebPaidCopilot` (see below). Metered by priority access (below). Tool requests carry the tool agent, with the `relay_batch` framing (hypotheses §24) |
 | `claude-opus-4.8` / `claude-opus-4.5` | `Claude_Opus` **+ included scenario** | **Claude Opus 4.8** (self-IDs "Claude Opus 4.8; Anthropic", cutoff 2026-01 or 2025-01, since 2026-10-11 at the latest; it was Claude Opus 4.5 before, and `claude-opus-4.5` is kept as an alias), premium accounts only, and **not** metered by priority access. Same tone as the row above: the scenario picks the model. Serves with the tool agent and without it on a premium account; on a non-premium one it is the "registered but dead" route either way, which the proxy reports as a 502 `model_route_unavailable`. Tool requests carry the agent: agent-less it has its own code interpreter and, under a framing that doesn't steer it out (`baseline`), works there instead of in the harness (1/10 vs 8/10 with the agent); under `relay_batch`, its default, the two paths tie (30/30 each, 2.60 vs 2.53 turns per task) (hypotheses §36). Tool-less requests go agent-less. Opus 4.5 served ONLY with the agent; its system prompt called it "Claude Opus 5", and it sometimes ended a tool fence with its native call markup (`</invoke>`, `</parameter>`, `</function_calls>`), which the parser strips (§24 F54, F57) |
+| `claude-auto` | `Claude_Auto` **+ paid scenario, over StreamHub** | **Opus 5.5 by self-ID, not counted in Opus's priority-access budget** (2026-11-23, hypotheses §62). Self-IDs "Claude Opus 5.5" (cutoff 2026-06) on the paid scenario over either transport and under `officeweb`, and sends chain-of-thought summaries as `Claude_Opus` does. Over Chathub's paid scenario every turn lowers `ClaudeOpusQueryDaily` and `ClaudeOpusQuery75` by 1, as `Claude_Opus` does; over StreamHub none did, while StreamHub's `Claude_Opus` turns did (below, *priority access*). So the proxy sends it over StreamHub whatever `M365_TRANSPORT` says (`STREAMHUB_MODELS`), under the paid scenario, agent-less. A non-premium account gets `ClaudeUnavailableForLicense` on either transport. On the included scenario the tone self-IDs as the GPT-5 chat model. Default framing `relay_batch` |
 | `claude-fable` / `claude-fable-5.1` | `Claude_Fable` | **Claude Fable 5.1** ("Fable 5.1" in the web client, marked "Uses credits"), mapped since 2026-11-18 — see the `Claude_Fable` note below. Serves on the included scenario; agent-less like every Claude tone but Opus. Its StreamHub turns are charged to the user's Copilot credits. Default framing `relay_batch`, unbenched (hypotheses §45) |
 | `gpt-5.5` / `gpt-5.5-quick` | `Gpt_5_5_Chat` | current GPT generation |
 | `gpt-5.5-think-deeper` | `Gpt_5_5_Reasoning` | |
-| `gpt-5.6-think-deeper` | `Gpt_5_6_Reasoning` | confirmed live 2026-08-06; reported picker label "GPT-5.6 Sol Think deeper" (hypotheses H-SOL56) |
-| `gpt-5.6` / `gpt-5.6-quick` | `Gpt_5_6_Chat` | reported picker label "GPT-5.6 Sol Quick response" (hypotheses H-SOL56). Live on the **included** scenario since 2026-09-24 — it was entitlement-gated before that (§18), which §12.15 misread as dead |
+| `gpt-5.6-think-deeper` | `Gpt_5_6_Reasoning` | confirmed live 2026-08-06; "GPT-5.6 Sol Think deeper" in the web client's model selector (hypotheses §63 F179) |
+| `gpt-5.6` / `gpt-5.6-quick` | `Gpt_5_6_Chat` | "GPT-5.6 Sol Quick response" in the web client's model selector (hypotheses §63 F179). Live on the **included** scenario since 2026-09-24 — it was entitlement-gated before that (§18), which §12.15 misread as dead |
 | `gpt-6-think-deeper` | `Gpt_6_Reasoning` | GPT-6 Think deeper. Reachable ONLY under `scenario=OfficeWebPaidCopilot` (see below), like Opus — but **not** separately metered. No chat variant: `Gpt_6_Chat` is rejected. Doesn't serve with the tool agent, so its tool requests go agent-less with a user-voice relay framing, `relay_batch` since hypotheses §25 (§22, #41) |
-| `gpt-6-sol` | `Gpt_6_Sol_Reasoning` | "GPT 6.0 Sol" in the web client (not called Think Deeper). Self-IDs as the GPT-6 reasoning model. **Not** gated on a premium account: serves on the included scenario there. A non-premium account is refused it by licence (`PremiumModelUnavailableForLicense`, hypotheses §49 F146), where it served on 2026-10-07 (§29). Takes the tool agent only on a **premium** account (non-premium: dead route, before the licence refusal), which the proxy learns at runtime; agent-less it has a sandbox of its own. Default framing `relay_batch` on both paths (hypotheses §23, §28, #23). `Gpt_6_Sol_Chat` is accepted but serves the GPT-5 chat model, so it isn't mapped |
+| `gpt-6-sol` | `Gpt_6_Sol_Reasoning` | "GPT 6.0 Sol" in the web client (not called Think Deeper). Self-IDs as the GPT-6 reasoning model. **Not** gated on a premium account: serves on the included scenario there. A non-premium account is refused it by licence (`PremiumModelUnavailableForLicense`, hypotheses §49 F146), where it served on 2026-10-07 (§29). Takes the tool agent only on a **premium** account (non-premium: dead route, before the licence refusal), which the proxy learns at runtime; agent-less it has a sandbox of its own. Default framing `relay_batch` on both paths (hypotheses §23, §28, #23). `Gpt_6_Sol_Chat` is accepted and unmapped: it self-IDs as the GPT-5 chat model on the included scenario, and as GPT-6 reasoning on the paid scenario and over StreamHub's `officeweb`, where the web client's "GPT-6" item sends it (hypotheses §63 F179, F180, H63a) |
 | `gpt-6.1-sol` | `Gpt_61_Sol_Reasoning` | "GPT-6.1 Sol" in the web client. Self-IDs as the GPT-6 reasoning model. Serves on the included scenario on a premium account (a non-premium account is refused it by licence, `PremiumModelUnavailableForLicense`, hypotheses §49 F146); the paid scenario serves it too but spends the `GPT61Sol*` budget (40/day, 75/week), so the proxy stays on the included one. Like `gpt-6-sol`, it serves with the tool agent attached only on a **premium** account (non-premium: dead route, so the proxy goes agent-less there), and agent-less it has the same kind of sandbox, though unlike `gpt-6-sol` it stays out of it under the user-voice framings (hypotheses §29). Default framing `relay_batch` on both paths (hypotheses §27). Every sibling (`Gpt_61_Sol`, `Gpt_61_Sol_Chat`, `Gpt_61_Reasoning`, `Gpt_61_Chat`, `Gpt_61`) is rejected |
 | `gpt-6.2-sol` | `Gpt_62_Sol_Reasoning` | "GPT-6.2 Sol" in the web client (since 2026-11-17; picking it sends this tone and no other model field). Self-IDs as the GPT-6 reasoning model, as in the web client. Serves on the included scenario (2026-11-18, n=1) and over StreamHub; the paid scenario's metering carries `GPT62SolQuery*` budgets, so the proxy stays on the included one, like `gpt-6.1-sol`. Default framing `relay_batch`, unbenched (hypotheses §45) |
 | `gpt-6.2-astra` | `Gpt_62_Astra_Reasoning` | "GPT-6.2 Astra" in the web client, marked "Uses credits": its StreamHub turns reported a `billing_info` charge to the user's Copilot credits (`PremiumModelsInM365Chat`, `creditInUse`) on Nov 17–18, and none on Nov 20 (hypotheses §49 F143). Otherwise routed like `gpt-6.2-sol` (`GPT62AstraQuery*` budgets on the paid scenario). The near misses `Gpt_61_Astra_Reasoning`, `Gpt_62_Luna_Reasoning` and `Gpt_63_Astra_Reasoning` are rejected (hypotheses §45) |
@@ -334,7 +355,7 @@ Two things worth separating, because conflating them wastes probes:
 - **`scenario` is the lever.** Flipping it to `OfficeWebPaidCopilot` is what makes `Claude_Opus` serve a real answer instead of the canned BotConnection apology. This also rewrites the old F23 reading of "Opus is a dead tone, 0/3": that measurement was taken on the included scenario, where the observation was correct and the conclusion wasn't. (On a premium account the included scenario has served a different model there since October 2026, Opus 4.8: hypotheses §36.)
 - **`licenseType` is not.** `Premium` is simply the value the paid scenario travels with; setting `licenseType` alone does **not** grant access to different models. We send the pair for coherence with the real client, not because both halves do work.
 
-This is an entitlement, not a bypass: the account has to actually hold the paid/premium access. On a seat that doesn't, the paid scenario is refused outright: the final item carries `result.value: "ForbiddenRequest"`, `errorCode: "InvalidCopilotLicense"`, and a BotConnection reply *"It looks like you don't have a valid licence. To get access, please check with your administrator…"* (~2.5 s). It is about the account, not the tone: `Gpt_5_6_Chat`, `Claude_Sonnet` and `Claude_Opus` were all refused this way (6/6 across two runs, agent attached, 2026-10-01; hypotheses §22 F46), and `Gpt_5_6_Chat` serves on the same account under the included scenario. One exception: with the agent attached, `Gpt_6_Reasoning` returns its dead-route `InternalError` instead (2/2), so an `InternalError` on the paid scenario doesn't prove the account is licensed. The licence refusal is a different wire state from the dead route's `InternalError` + "Sorry, I wasn't able to respond to that". The proxy has no handling for it yet. A non-premium seat is refused the same way under `officeweb`, StreamHub's scenario, on either transport (hypotheses §49 F145).
+This is an entitlement, not a bypass: the account has to actually hold the paid/premium access. On 2026-10-01 the paid scenario refused a seat that doesn't outright: the final item carried `result.value: "ForbiddenRequest"`, `errorCode: "InvalidCopilotLicense"`, and a BotConnection reply *"It looks like you don't have a valid licence. To get access, please check with your administrator…"* (~2.5 s). It was about the account, not the tone: `Gpt_5_6_Chat`, `Claude_Sonnet` and `Claude_Opus` were all refused this way (6/6 across two runs, agent attached; hypotheses §22 F46), and `Gpt_5_6_Chat` serves on the same account under the included scenario. One exception: with the agent attached, `Gpt_6_Reasoning` returns its dead-route `InternalError` instead (2/2), so an `InternalError` on the paid scenario doesn't prove the account is licensed. The licence refusal is a different wire state from the dead route's `InternalError` + "Sorry, I wasn't able to respond to that". The proxy has no handling for it yet. A non-premium seat was refused the same way under `officeweb`, StreamHub's scenario, on either transport (Nov 20, hypotheses §49 F145). **M365 no longer sends `InvalidCopilotLicense` under either scenario** (2026-11-23, agent-less, hypotheses §61 F170, F171). A Claude or GPT-6.x tone gets its own model refusal, `ClaudeUnavailableForLicense` or `PremiumModelUnavailableForLicense` (below), the same as on the included scenario; on the paid scenario that covers every tone the proxy routes there. A tone without that gate (`Gpt_5_5_Chat`, `Gpt_5_6_Chat`, `magic`) gets a turn that ends `Success` with no text and no `errorCode` (§13).
 
 **A non-premium seat is also refused by model.** On the included scenario, the one it can use, a non-premium account is refused the Claude tones (`Claude_Sonnet`, `Claude_Sonnet_5`, `Claude_Reasoning`, `Claude_Opus`, `Claude_Fable`) with `result.value: "ForbiddenRequest"`, `errorCode: "ClaudeUnavailableForLicense"` ("Claude isn't available with your current license. Choose another model and try again.") and the GPT-6.x tones (`Gpt_6_Reasoning`, `Gpt_6_Sol_Reasoning`, `Gpt_6_Sol_Chat`, `Gpt_61_Sol_Reasoning`, `Gpt_62_Sol_Reasoning`, `Gpt_62_Astra_Reasoning`, `Gpt_6_Astra_Reasoning`) with `PremiumModelUnavailableForLicense` ("This model requires a Premium license…"), in 0.5–2.5 s, on both transports, agent-less or with the tool agent. On Chathub the refusal is only in the final `result`; StreamHub ends the turn at a `request_end` carrying it (§13). That leaves `magic` and the GPT-5.5 and GPT-5.6 tones. The refusals were recorded on another tenant on 2026-11-03 (open PR #99), on a non-premium account on 2026-11-06, and on 2026-11-20 on every non-premium account probed (hypotheses §49 F146). The proxy has no handling for them either: on Chathub it reads the turn as empty, re-sends "Please continue." twice and answers 502.
 
@@ -378,7 +399,9 @@ Each Opus turn on the paid scenario (agent or not) lowers `ClaudeOpusQuery75` an
 
 **Sonnet 5.5 has an allowance of its own** (2026-10-06, hypotheses §26 F64). When `Claude_Sonnet` @ paid became Sonnet 5.5 the map gained `ClaudeSonnet55QueryDaily` and `ClaudeSonnet55QueryWeekly`. They read 79 / 149 after the first Sonnet 5.5 turn of the day (a Tuesday, so the week had started a day earlier) and dropped by exactly 1 on each later Sonnet 5.5 turn, agent or not, including a follow-up turn in the same conversation; Sonnet 5 (`Claude_Sonnet_5`), GPT-6 Sol and GPT-5.5 turns lowered neither. So: **80 turns a day and 150 a week**, one per turn, separate from the Opus budget. **The weekly key resets at midnight UTC every day, not on Monday** (three resets running, 2026-10-06 to -08: it read 94 at 21:56Z on a Wednesday and 150 on the first paid turn after midnight; Opus's weekly key stayed at 0 over the same midnight; hypotheses §30), so with 80 a day the 150 never binds. Its refusal text hasn't been observed yet; the proxy assumes Opus's (`OutOfCredits`, midnight UTC; it would remember a weekly wall until Monday, which can't happen while the weekly key resets daily).
 
-**GPT-6.1 Sol's allowance, `GPT61SolQueryDaily` (40) / `GPT61SolQueryWeekly` (75), is spent by `Gpt_61_Sol_Reasoning` on the paid scenario** (2026-10-06, hypotheses §27 F67). The tone turned up after §26 had found the keys with no tone to match. On a premium account each paid-scenario `Gpt_61_Sol_Reasoning` turn lowered the weekly key by exactly 1, agent or not (74 → 69 over five turns, daily 34 alongside), and included-scenario turns carry no `metering` at all and lowered nothing. Both scenarios self-ID identically ("GPT-6 reasoning model"), and nothing else on the wire differs. `gpt-6.1-sol` therefore routes on the included scenario, which also serves every non-premium account (the paid one answers there with `InvalidCopilotLicense`), so it spends nothing. `M365_SCENARIO=OfficeWebPaidCopilot` would put it on the budget, which the proxy doesn't track.
+**GPT-6.1 Sol's allowance, `GPT61SolQueryDaily` (40) / `GPT61SolQueryWeekly` (75), is spent by `Gpt_61_Sol_Reasoning` on the paid scenario** (2026-10-06, hypotheses §27 F67). The tone turned up after §26 had found the keys with no tone to match. On a premium account each paid-scenario `Gpt_61_Sol_Reasoning` turn lowered the weekly key by exactly 1, agent or not (74 → 69 over five turns, daily 34 alongside), and included-scenario turns carry no `metering` at all and lowered nothing. Both scenarios self-ID identically ("GPT-6 reasoning model"), and nothing else on the wire differs. `gpt-6.1-sol` therefore routes on the included scenario, so it spends nothing. On 2026-10-06 that scenario also served non-premium accounts, and the paid one refused them with `InvalidCopilotLicense`; §5 says what each scenario does with such an account now. `M365_SCENARIO=OfficeWebPaidCopilot` would put it on the budget, which the proxy doesn't track.
+
+**Turns over StreamHub spend these budgets without reporting them, except `Claude_Auto` turns** (2026-11-23, premium account, hypotheses §62 F173). A StreamHub turn carries no `metering` map, under `OfficeWebPaidCopilot` too (§13), so the allowances were read with a Chathub paid-scenario `Gpt_5_5_Chat` turn, which lowers none of them, before and after each StreamHub turn (`scripts/metering-probe.mjs`). Over StreamHub every `Claude_Opus` turn lowered both Opus keys by exactly 1, under the paid scenario (7 of 7) and under `officeweb` (1 of 1), and every `Claude_Sonnet` turn under the paid scenario lowered both Sonnet 5.5 keys (3 of 3). `Claude_Auto`, which self-IDs as Opus 5.5, lowered Opus's keys over Chathub's paid scenario (2 of 2, a one-word prompt included) and **no key over StreamHub** (0 of 10 probe turns under the paid scenario, 0 of 1 under `officeweb`, and 0 of 37 turns of a bench and real-pi runs through the proxy, §62 F176), with a charged `Claude_Opus` StreamHub turn before and after each of the first two. No StreamHub turn carried a `billing_info` item. So `claude-auto` routes to StreamHub's paid scenario (§5 table), and the proxy's budget handling leaves it out (`meteredBudgetOf`). The proxy can't read the allowances on StreamHub, so it can't tell when one is close to 0, and what a StreamHub turn gets once a budget is used up hasn't been observed.
 
 **What the proxy does with it** (`priority-access.ts`, `handler.ts`): `priorityAccessExhaustionOf()` reads `OutOfCredits` / `result.message` (and still the text, in case a refusal ever streams), and the proxy returns **HTTP 429** with `code: "priority_access_exhausted"`, `param: "day"|"week"` and a `Retry-After` counted to the UTC reset. It remembers the wall until that reset (`activePriorityAccessExhaustion`, per budget), so later requests on that budget get the 429 without an M365 turn. Each turn's allowances are surfaced as `usage.x_m365_opus_daily_remaining` / `x_m365_opus_weekly_remaining` and `usage.x_m365_sonnet55_daily_remaining` / `x_m365_sonnet55_weekly_remaining`. With `M365_OPUS_FALLBACK_MODEL=claude-opus-4.8` (opt-in) the request is re-sent, whole, to that model in a fresh conversation instead of the 429, and later requests go straight there until the reset (issue #18). `M365_SONNET_FALLBACK_MODEL` does the same for Sonnet 5.5 (e.g. `claude-sonnet-5`, which is unmetered). A fallback that names a metered model is ignored.
 
@@ -398,14 +421,52 @@ Prompt size doesn't matter to this budget — it counts turns (above). So the pr
 >
 > **GPT-6.1 Sol (2026-10-06, hypotheses §27) splits exactly like GPT-6 Sol:** with the agent, `Gpt_61_Sol_Reasoning` serves on a premium account (8/8 across both scenarios) and is the dead route on both non-premium accounts (3/3, included and paid); agent-less it serves on the included scenario everywhere. It is in `PREMIUM_ONLY_AGENT_TONES` too, and the learned fallback is per tone.
 
-### Reading the picker's model list from the browser's HTTP cache (no quota)
+### Reading the picker's model list (no quota)
 
 When the web client's model picker shows a label that matches no known tone, the cheapest first
-check is the picker's own data, which costs no chat turn and no quota. The client fetches a menu
-JSON whose items pair a tone `id` with a `menuItemTitle`, for example
-`{"id":"Gpt_5_6_Chat","menuItemTitle":"GPT-5.6 Sol Quick response"}` (a reported reading, Nov 2026).
-In that reading, the browser cache contained a gzip-encoded response body; the following scans for
-that format without capturing traffic:
+check is the picker's own data, which costs no chat turn and no quota.
+
+**The selector's own request (2026-11-23, hypotheses §62 F177, F178).** The web client gets its model
+selector with `POST https://copilot.cloud.microsoft/resources/app-shell-action`, body
+`{"action":"RefreshNavPane"}`. `scripts/chathub-tones.mjs` sends it and prints the items as a table
+with `Tone` and `Title` columns; given the path of a saved reply, it reads that file and sends nothing.
+The items are in
+`store.bizchatAsAgentGpt.clientPreferences.modelSelectorMetadata.availableModelSelectionOptions`, and again
+under `store.bizchatAsAgentGptWebTab`: an object with `type: "item"`, `id` (the tone the item sends) and
+`menuItemTitle`, or a group whose `itemGroup` array contains such objects. Saved to a file, this jq
+filter lists the same items, one line each:
+
+```sh
+jq -r '([.store.bizchatAsAgentGpt.clientPreferences.modelSelectorMetadata.availableModelSelectionOptions[]] +
+  [.store.bizchatAsAgentGptWebTab.clientPreferences.modelSelectorMetadata.availableModelSelectionOptions[]])[] |
+  ([select(.type == "item")] + [select(.itemGroup != null) | .itemGroup[] | select(.type == "item")])[] |
+  "Tone: " + .id + ", Title: " + .menuItemTitle' RefreshNavPane.json | sort -u
+```
+
+The server answers with JSON only when the request sends `Accept: application/json`; without that header
+it returns the app's HTML page (200, `text/html`). The browser's request carries no `Authorization`
+header: the site's session cookies (`OhpAuth`, `OhpToken`, `OH.SID` and others) authenticate it. The
+server accepts a bearer token too, and the token decides what the store holds. With a token for
+`https://m365.cloud.microsoft/v2/M365Copilot.Read.All`, the scope the web app's own sign-in asks for, the
+reply is the whole store, and the proxy's MSAL client gets that token from its cached refresh token; the
+script sends it. With the proxy's Sydney token the reply holds only `store.notebooks`, with
+`"errorMessage": "HTTP 401: "`. With no credentials the server answers 302, to the web app's sign-in page.
+
+On a premium account on 2026-11-23 it listed `Magic` (Auto), `Chat` (Quick response), `Reasoning` (Think
+deeper), `Gpt_5_6_Chat` (GPT-5.6 Sol Quick response), `Gpt_5_6_Reasoning` (GPT-5.6 Sol Think deeper),
+`Gpt_6_Sol_Chat` (GPT-6), `Gpt_61_Sol_Reasoning` (GPT-6.1 Sol), `Claude_Sonnet` (Sonnet 5.5) and
+`Claude_Opus` (Opus 5.5) (hypotheses §63 F179), and no `Claude_Auto`. On a non-premium account the same
+day it had 5 items (`Magic`, `Chat`, `Reasoning`, `Gpt_5_6_Chat`, `Gpt_5_6_Reasoning`) and no Claude or
+GPT-6.x item, so read the list on the kind of account in question. Each Claude item names a policy in
+`policyExpression`, with `policyFailureBehavior: "disable"` and `policyDisabledInfoMessage: "Your
+organization did not enable this model."`; the GPT items have `policyExpression: null`. So a Claude item
+in the list can still show as disabled in the client.
+
+**From the browser's HTTP cache.** The same items can be read without making the request: the client's
+menu JSON pairs a tone `id` with a `menuItemTitle`, for example
+`{"id":"Gpt_5_6_Chat","menuItemTitle":"GPT-5.6 Sol Quick response"}` (a reported reading, Nov 2026). In
+that reading, the browser cache contained a gzip-encoded response body; the following scans for that
+format without capturing traffic:
 
 1. Open the picker once in the signed-in web client, so the menu has been fetched.
 2. Find the cache directory: for Edge on Windows, usually
@@ -598,9 +659,11 @@ The final `type:2` frame carries the canonical state of the whole conversation i
 - This is why we **reuse one conversation** across an agent session and send **only new messages** on follow-up turns (delta mode) — every `Please continue.` retry also counts against the 600.
 - There is also opaque **account-level throttling** (rapid-fire requests can start returning empties). It recovers on its own.
 
-### 50 turns a day across the whole account: `TotalTurnUsageDaily` (2026-11-22)
+### A daily turn allowance across the whole account: `TotalTurnUsageDaily` (2026-11-22)
 
-Every turn's `throttling.metering` map now carries **`TotalTurnUsageDaily`**. It reads 49 after the first turn of the UTC day and drops by exactly 1 per Chathub turn, whatever the model, agent or not, follow-up turns included. That makes it **50 turns a day per account**, shared with the web UI. It resets at 00:00 UTC (measured to ±25 s on 2026-11-23). Images, license refusals and StreamHub turns cost nothing, and concurrent turns can overshoot it (see the day-2 subsection below). On 2026-11-22 a bench took it from 49 to 0 between 01:11:18Z and 01:20:53Z, one turn every ~5 s. The next turn was refused like this:
+On a non-premium account, a Chathub turn's `throttling.metering` map now carries **`TotalTurnUsageDaily`**: the turns the account has left today, the web UI's turns included (day 2, below). It drops by exactly 1 per Chathub turn, whatever the model, agent or not, follow-up turns included, and it resets at 00:00 UTC (the change fell within a 25-second window on the study's account and a 52-second window on another, 2026-11-23; day 2, hypotheses §61 F167). Images, license refusals and StreamHub turns cost nothing, and concurrent turns can overshoot it (day 2; StreamHub on another account too, §61 F172). **The allowance differs between accounts.** The usage-limit study's account (data in `docs/quota/`), a Basic account in one tenant, reads 49 after the first turn of the UTC day, so it gets **50 turns a day**. A non-premium account in another tenant reads 998 after its first turn, so it gets **999** (§61 F167). A premium account's map has no such key. What sets the allowance is open (§61 H61b). The study's tenant has the consumptive-billing flags on (*Other limits the client knows about*, below). So read the account's own counter, `usage.x_m365_total_turns_daily_remaining`, instead of assuming 50. Now and then a turn reports a value higher than one already reported (12 of 120 turns, §61 F167; day 2 has one 48 minutes old), so keep the lowest value of the UTC day.
+
+On 2026-11-22 a bench took the study's account from 49 to 0 between 01:11:18Z and 01:20:53Z, one turn every ~5 s. The next turn was refused like this:
 
 ```json
 "result": { "value": "OutOfCredits", "message": "You've used your daily chat limit. Please try again tomorrow.",
@@ -609,17 +672,17 @@ Every turn's `throttling.metering` map now carries **`TotalTurnUsageDaily`**. It
 
 The reply comes from `contentOrigin: "BotConnection"` with `turnState: "Failed"`, the same shape as the priority-access wall, and the message names no reset time. This is not `PerUserThrottled` (that one clears in about an hour) and not priority access (that one is per model). Refusals ("no tool is available") showed up before the wall did.
 
-For an agent harness this is the binding limit: every tool step is a turn, so 50 is a few tasks a day. Since ba10843 the proxy handles it: the first refusal is remembered for the whole account, and every chat model gets a 429 `daily_turn_quota_exhausted` with `Retry-After` to midnight UTC, without an M365 turn and without falling back to another model (all of them are refused alike). `usage.x_m365_total_turns_daily_remaining` carries the counter on every answered turn. Image generation is not blocked, because it still works past the limit (below).
+At 50 a day this is the binding limit for an agent harness: every tool step is a turn, so 50 is a few tasks a day. Since ba10843 the proxy handles it: the first refusal is remembered for the whole account, and every chat model gets a 429 `daily_turn_quota_exhausted` with `Retry-After` to midnight UTC, without an M365 turn and without falling back to another model (all of them are refused alike). It goes by the result's `errorCode`; the refusal text alone counts only on a turn that didn't succeed, so an answer that quotes the text doesn't block the account. `usage.x_m365_total_turns_daily_remaining` carries the counter on every answered turn whose map has it. Image generation is not blocked, because it still works past the limit (below).
 
-The key wasn't in the log before 2026-11-21. The log doesn't go back far enough to say when Microsoft added it.
+The key wasn't in the study's log before 2026-11-21, and that log doesn't go back far enough to say when Microsoft added it. In another tenant, a non-premium account's map had 40 keys and no `TotalTurnUsageDaily` on 2026-10-24 (§61 F168). `M365_DEBUG=1` doesn't show the key: it logs each frame cut to 500 characters, and `throttling` comes after the `messages` array. A frame dump (`M365_DUMP_FRAMES=1`) or `M365_TRACE=1` has it.
 
-### How the daily turn limit behaves (measured 2026-11-22)
+### How the daily turn limit behaves (measured 2026-11-22 on the study's account, 50 a day)
 
 Data: `docs/quota/` (`direct.jsonl` for turns sent straight to M365, `sent.jsonl` for turns sent through the proxy, and the proxy log extracted with `scripts/quota-log.mjs`). Tooling: `scripts/quota-direct.mjs`, `scripts/quota-probe.sh`, `scripts/quota-day.sh`.
 
 **Cost per turn.** 49 consecutive think-deeper turns (01:11–01:21Z, prompts from 300 to 56,000 characters, first turns and follow-ups alike) each took the counter down by exactly 1. An image turn at 01:14Z (`tone: magic`, temporary chat, a `GraphicArt` result) cost **0** and moved no key, `ImageGeneration` (100) included. `ReasoningModelTurnUsage` stayed at 10 through all 49 reasoning turns, so this path doesn't spend it. The client knows an errorCode `ReasoningTurnExhausted` for it, which hasn't been seen yet.
 
-**What 0 refuses.** Every tone tried (`Gpt_5_5_Chat`, `Gpt_5_5_Reasoning`, `Gpt_5_4_Reasoning`, `Gpt_5_6_Reasoning`, `magic`), on Chathub, on StreamHub (included scenario; StreamHub carries no metering at all), and in the web UI. Claude (all tones) and GPT-6.x never reach the meter on this license: they come back `ForbiddenRequest` / `ClaudeUnavailableForLicense` / `PremiumModelUnavailableForLicense`, at any count.
+**What 0 refuses.** Every tone tried (`Gpt_5_5_Chat`, `Gpt_5_5_Reasoning`, `Gpt_5_4_Reasoning`, `Gpt_5_6_Reasoning`, `magic`), on Chathub, on StreamHub (included scenario; StreamHub carries no metering at all), and in the web UI. Claude (all tones) and GPT-6.x never reach the meter on that license: they come back `ForbiddenRequest` / `ClaudeUnavailableForLicense` / `PremiumModelUnavailableForLicense`, at any count.
 
 **Two kinds of refusal.**
 - *Fast* (~1.2 s): almost every refusal. The gate is checked before the model runs.
@@ -637,11 +700,11 @@ It looks like the gate failing open now and then. The proxy doesn't use it: hamm
 
 **Web UI at 0.** The same refusal text, plus a card "**Upgrade to keep going** — You've reached your daily chat limit. Upgrade your plan to get more Copilot features and usage." with an Upgrade button. The client builds it from the final frame's `result.errorCode` (`TotalTurnDailyLimitUpsell`, behind the flag `enableTotalTurnDailyLimitUpsell`, AAD accounts only). No `MeteringInfo` frame, no `throttling.meteringLimitAlerts`. Adding the web client's opt-in variants `feature.EnableMeteringThrottleChatRequest` and `feature.EnableFreeMSA_AADUser100TurnLimit` to the WS query doesn't change the refusal.
 
-**Not this limit.** `PerUserThrottled` ("We're temporarily unable to respond to this volume of requests") is the thread-rate bucket of hypotheses §24 F58 (~100 turns, refilling ~1.6 a minute, then a ~1 h hold). All 25 occurrences in this proxy's log came in one burst on 2026-10-14 (11:28–12:01Z). None have come since.
+**Not this limit.** `PerUserThrottled` ("We're temporarily unable to respond to this volume of requests") is the thread-rate bucket of hypotheses §24 F58 (~100 turns, refilling ~1.6 a minute, then a ~1 h hold). All 25 occurrences in the study's proxy log came in one burst on 2026-10-14 (11:28–12:01Z). None have come since.
 
-**Other limits the client knows about** (bundles from 2026-11-22). Upsell reasons: `MaxTotalTurn TotalTurnDailyLimit ReasoningTurnLimit ConversationTurnLimit MaxDailyUsage MaxPromptPerSession MaxCharactersPerQuery MaxOneFileUploadPerPrompt FileSizeLimit MaxGPTImageAnalysis MaxGPTImageAnalysisUpgrade`. Result codes: `TotalTurnDailyQuotaExhausted`, `ReasoningTurnExhausted`, `ConversationTurnLimitReached` (also `turns >= maxTurns` on the conversation), and `creditScenario` values `TotalTurn` and `ImageKnowledge` ("Max GPT Image analysis per account"). The flag `enableFreeAadUser100TurnLimit` adds the variant `feature.EnableFreeMSA_AADUser100TurnLimit`, which suggests a 100-turn per-conversation cap for free AAD users. The tenant's loki config has the consumptive-billing flags on (`PLGSDKConsumptiveBilling`, `EnableConsumptiveBillingCostCommand`, `EnableConsumptiveBillingCreditRequestScenarios`).
+**Other limits the client knows about** (bundles from 2026-11-22). Upsell reasons: `MaxTotalTurn TotalTurnDailyLimit ReasoningTurnLimit ConversationTurnLimit MaxDailyUsage MaxPromptPerSession MaxCharactersPerQuery MaxOneFileUploadPerPrompt FileSizeLimit MaxGPTImageAnalysis MaxGPTImageAnalysisUpgrade`. Result codes: `TotalTurnDailyQuotaExhausted`, `ReasoningTurnExhausted`, `ConversationTurnLimitReached` (also `turns >= maxTurns` on the conversation), and `creditScenario` values `TotalTurn` and `ImageKnowledge` ("Max GPT Image analysis per account"). The flag `enableFreeAadUser100TurnLimit` adds the variant `feature.EnableFreeMSA_AADUser100TurnLimit`, which suggests a 100-turn per-conversation cap for free AAD users. The study's tenant has the consumptive-billing flags on in its loki config (`PLGSDKConsumptiveBilling`, `EnableConsumptiveBillingCostCommand`, `EnableConsumptiveBillingCreditRequestScenarios`). Whether they are what sets its allowance to 50 is open (hypotheses §61 H61b).
 
-### Day 2 (2026-11-23): reset, cost per kind of turn, overshoot
+### Day 2 (2026-11-23, the study's account): reset, cost per kind of turn, overshoot
 
 Run with `scripts/quota-day.sh` (rows `reset`, `c*`, `sh-*`, `web-*`, `burn`, `race-*`, `zero-d2` in `direct.jsonl`). Anything that doesn't report a value of its own was bracketed by control pongs.
 
@@ -659,7 +722,7 @@ Run with `scripts/quota-day.sh` (rows `reset`, `c*`, `sh-*`, `web-*`, `burn`, `r
 | `ForbiddenRequest` license refusal (Claude) | **0** |
 | **StreamHub text turn**, with a real answer, on `Gpt_5_5_Chat`, `Gpt_5_5_Reasoning` and `magic` | **0** (6 turns; a control 16 minutes later showed no delayed charge) |
 
-StreamHub turns aren't charged, but they are refused at 0 (day 1). They don't get around the wall; they just don't count toward it. StreamHub carries no `throttling.metering` and no `billing_info`. The proxy uses Chathub by default (`M365_TRANSPORT=streamhub` switches it, with the agent caveats in hypotheses §49 F144). Switching the proxy to save quota is a decision for a person, not a default: it relies on a metering gap that Microsoft can close at any time.
+StreamHub turns aren't charged, but they are refused at 0 (day 1). They don't get around the wall; they just don't count toward it. StreamHub carries no `throttling.metering` and no `billing_info`. The proxy uses Chathub by default (`M365_TRANSPORT=streamhub` switches it, with the agent caveats in hypotheses §49 F144; a non-premium account also needs `M365_SCENARIO=OfficeWebIncludedCopilot`, or a model without its own licence gate gets empty turns, §13). Switching the proxy to save quota is a decision for a person, not a default: it relies on a metering gap that Microsoft can close at any time.
 
 **Concurrent turns overshoot 0.** With 1 turn left, 6 turns were started within 2.6 s. **5 succeeded** (the 4 that started within 0.5 s of each other, plus the first). Only the one that started last was refused. The check before the turn isn't atomic with the decrement, so turns already in flight all pass. The counter stops at 0, so it doesn't show the overshoot.
 
@@ -671,13 +734,13 @@ StreamHub turns aren't charged, but they are refused at 0 (day 1). They don't ge
 
 **What's still unknown**
 - Why `ReasoningModelTurnUsage` (10) never moves, and what triggers `ReasoningTurnExhausted`.
-- Whether the free AAD 100-turn per-conversation limit applies to this account (no conversation here went past 9 turns).
+- Whether the free AAD 100-turn per-conversation limit applies to the study's account (no conversation here went past 9 turns).
 - What the ~8 % leak at 0 is exactly (a lagging replica fits but isn't proven).
 - Whether Teams and the Office apps (other surfaces) share the counter. Only the web UI was tested.
 
 ### The API behind usage limits (2026-11-22)
 
-Found in the web client's bundles (all 2,356 rspack chunks, listed in `runtime.<hash>.js`, public on `res.public.onecdn.static.microsoft/midgard/versionless-v2/`). There are three channels. Only the first applies to this account.
+Found in the web client's bundles (all 2,356 rspack chunks, listed in `runtime.<hash>.js`, public on `res.public.onecdn.static.microsoft/midgard/versionless-v2/`). There are three channels. Only the first applies to the study's account.
 
 **1. In-band on the chat stream.** This is where the chat client reads limits. The client's parser (`meteringInfo` / `billing_info` handling in the Sydney client chunk) knows three frame kinds:
 - `throttling.metering`, every turn: `{<key>: {remainingAllowance}}`, as above. The full key list on 2026-11-22: `TenantDataAccess ImageAnalysis LLMOnly VisualCreator PersonalDataAccess GraphicArt CodeInterpreter FileReference DeepResearch CopilotTuning DeepWork WXPAgentMode NotebookCowork ImageGeneration ClaudeOpusQuery ClaudeOpusQuery75 ClaudeOpusQueryDev ClaudeOpusQueryC1 ClaudeOpusQueryC2 ClaudeOpusQueryDaily(…C1/C2) ClaudeOpusQueryHourlyDev ArtifactGeneration ReasoningModelTurnUsage ClaudeOpus(55)Query{Daily,Weekly}Word Gpt6Query{Daily,Weekly} GPT61SolQuery{Daily,Weekly}(Word) ClaudeSonnet55{Query,}{Daily,Weekly}(Word) TotalTurnUsageDaily GPT62SolQuery{Daily,Weekly}(Word) GPT62AstraQuery{Daily,Weekly}(Word) CostQuota`.
@@ -691,13 +754,13 @@ viewer { aiCredits {
     entitlements { hasAccess serviceName availableQuantity entitledQuantity uslDetails{evaluationResult licenseId} capacityDetails{billingPlanId evaluationResult billingPolicyEvaluationResult} } }
   creditRequests { requestId state approvedCredits … } } }
 ```
-Valid services: `PremiumModelsInM365Chat`, `M365CopilotChatAdvancedWork`, `ResearcherCritiqueAndCouncil`. A wrong service name gives "Neptune request failed". There are also mutations `creditRequestCreate` / `creditRequestUpdate` (asking the admin for more credits). On this account all three services return `hasAccess:false`, 0/0, USL `Skipped` and Capacity `Skipped`, which the client maps to `NotConfigured`: the tenant has no AI-credits plan. The same endpoint serves `PLGEnvironmentQuery` (upsell scenarios).
+Valid services: `PremiumModelsInM365Chat`, `M365CopilotChatAdvancedWork`, `ResearcherCritiqueAndCouncil`. A wrong service name gives "Neptune request failed". There are also mutations `creditRequestCreate` / `creditRequestUpdate` (asking the admin for more credits). On the study's account all three services return `hasAccess:false`, 0/0, USL `Skipped` and Capacity `Skipped`, which the client maps to `NotConfigured`: its tenant has no AI-credits plan. The same endpoint serves `PLGEnvironmentQuery` (upsell scenarios).
 
 **3. Cowork v2 ("Aether") REST**, base `aether-*.microsoft.com/api` or a routed `*.island.powerapps.com` gateway: `GET /users/me/cost` and `GET /users/me/creditRequest`, next to `/v1/tasks`, `/conversations` and `/projects`. That's Cowork's agentic billing, not chat.
 
 To call #2: take the `__request_headers` from the app's own `PLGEnvironmentQuery` POST, swap in the query and variables, and post to the same URL. It's read-only and costs no chat turn.
 
-### What the web UI shows about usage (2026-11-22, a Basic account)
+### What the web UI shows about usage (2026-11-22, the study's Basic account)
 
 Read-only look at copilot.cloud.microsoft, no chat sent. The plan label under the account name reads **"M365 Copilot (Basic)"**, and its info tooltip says "Availability may be limited during peak demand." That is all there is: **no usage meter**, nothing in the model picker (Auto / Quick response / Think deeper / GPT ▸) and no usage page in Settings. The `PLGEnvironmentQuery` call (loki.delve.office.com) asks for the scenarios `ImageLimitsCapacityUpsell` and `ImageLimitsDailyLimitUpsell` but only gets an "Upgrade" button back, so the image-limit UI seems to show up only once a limit is hit.
 
@@ -706,7 +769,7 @@ Microsoft has built a full meter UI, though. It's in the PLG SDK strings (`res.p
 - **Consumer tier:** a *weekly AI limit*. There's a banner ("{0} of weekly AI limit remaining", "Weekly AI limit reached"), the fallback "continue with Copilot Chat until your limit resets on {0}", and Copilot Credits that take over once the limit is used up.
 - **Org tier (`consumptiveBilling`):** *monthly credits* set by an admin, per user or as a shared group pool. There are banners at 50% and 20% remaining, "{n} credits used for this chat", and a "Usage" dialog with a meter ("Your usage limit" / "Shared usage pool"), a daily bar chart of credits spent, and credits broken down by use case, chat, task and session. It covers Chat ("Advanced models in Chat"), Code, Cowork and Autopilot. "Limits reset on {0}" is the first of the month.
 
-None of those strings is "daily chat limit"; that text comes from the server. Watch for the **Usage dialog or credit banner appearing on this account**: it would mean the tenant moved onto metered credits, and the turn-count assumptions above stop holding.
+None of those strings is "daily chat limit"; that text comes from the server. Watch for the **Usage dialog or credit banner appearing on the study's account**: it would mean its tenant moved onto metered credits, and the turn-count assumptions above stop holding.
 
 ### Account degradation under sustained use (observed June 13 2026)
 
@@ -949,7 +1012,7 @@ Evidence (`scripts/dataverse-bot-probe.mjs`, with a `<org>.crm4.dynamics.com/.de
 | 23 | **Code interpreter is real:** `cwc_code_interpreter*` optionsSets + `GeneratedCode` msg type → genuine server-side Python execution. Proxy enables it on the agent-less path. **GPT-6 Sol runs `bash -lc …` in a sandbox (`/mnt/data`, `/home/oai`) agent-less even without those optionsSets** (hypotheses §23 F50) | §5 |
 | 24 | **`optionsSets` was sent empty** — leaves code-interpreter/memory/custom-instructions/image off the table. Reference impls (PyRIT, kuchris) populate it | §5/hypotheses §8 |
 | 25 | **`scenario` gates the model list.** `Gpt_6_Reasoning` is a dead route on `OfficeWebIncludedCopilot` and a real model on `OfficeWebPaidCopilot`, and so was `Claude_Opus` agent-less until October 2026 (on a premium account it is now Opus 4.8 on the included one, Opus 5.5 on the paid one, §36). `licenseType: Premium` rides along but unlocks nothing by itself. Proxy derives it per-turn from the model ID. The scenario can also change which model a tone is: `Claude_Sonnet` is Sonnet 4.6 included and Sonnet 5.5 paid (Sonnet 5, now `Claude_Sonnet_5`, until 2026-10-06). The gate says nothing about metering — GPT-6 and Sonnet 5 are gated but not separately budgeted | §5 |
-| 26 | **Priority-access caps — Opus 5.5 (40 turns/day, 75/week) and Sonnet 5.5 (80/day, 150/week), one per turn** — end the turn with `result.value: "OutOfCredits"` and a refusal that is NOT streamed — it exists only in the final item — so a stream reader sees an empty turn and every generic guard misreads it. Read the result; the proxy 429s, remembers it per budget until the reset (midnight UTC; weekly: Monday — though Sonnet 5.5's weekly key has reset daily, hyp §30), and can fall back (`M365_OPUS_FALLBACK_MODEL`, `M365_SONNET_FALLBACK_MODEL`) | §5/§15, hyp §24 F59, §26 |
+| 26 | **Priority-access caps — Opus 5.5 (40 turns/day, 75/week) and Sonnet 5.5 (80/day, 150/week), one per turn** — end the turn with `result.value: "OutOfCredits"` and a refusal that is NOT streamed — it exists only in the final item — so a stream reader sees an empty turn and every generic guard misreads it. Read the result; the proxy 429s, remembers it per budget until the reset (midnight UTC; weekly: Monday — though Sonnet 5.5's weekly key has reset daily, hyp §30), and can fall back (`M365_OPUS_FALLBACK_MODEL`, `M365_SONNET_FALLBACK_MODEL`). Turns over StreamHub spend them without reporting a `metering` map, except `Claude_Auto` turns, which spend none (`claude-auto`) | §5/§15, hyp §24 F59, §26, §62 |
 | 27 | **The final text loses `[word]:`.** M365's post-processing deletes a bracketed word, the colon after it and the whitespace after that from a message's final snapshot — in code blocks too, and not every occurrence: `[regex]::Replace(` → `:Replace(`, `if row[col]:` + newline + indent → `if row` glued to the next line, `{[key]: 1}` → `{1}`. Dotted names (`[IO.File]::`), `[x] :` and brackets without a colon survive. Both transports, every model tried. The token deltas carry the model's own text; a short reply may have none. The proxy restores from the deltas (`restoreStrippedBrackets`), asks PowerShell for full dotted type names, and doesn't run a PowerShell call left with `:Member(` | hyp §40 F111 |
 
 ---
@@ -1007,7 +1070,9 @@ from `m365.cloud.microsoft` (browser devtools → WS frames) and diff against th
 
 ## 13. StreamHub — the new web client's transport (Nov 2026)
 
-The new web client (`copilot.cloud.microsoft`) doesn't use Chathub. It talks to
+The new web client (`copilot.cloud.microsoft`) doesn't use Chathub. Not every user gets it: on Nov 23
+2026 some users' client at the same address still sent its turns over Chathub (hypotheses §45 F120).
+The new client talks to
 
 ```
 wss://substrate.svc.cloud.microsoft/m365Copilot/StreamHub/{oid}@{tid}?{query}
@@ -1017,9 +1082,13 @@ with the same SignalR JSON protocol, `0x1E` separators and Sydney token (`access
 query). The proxy sends a turn this way under `M365_TRANSPORT=streamhub` (`getTransport`,
 `session.ts`), and so does the probe helper `scripts/_probe-chat.mjs`, under the same variable or
 with `transport: "streamhub"`. Observed 2026-11-11 on a premium account; hypotheses §40. A non-premium
-account is refused under the `officeweb` scenario on either transport (`InvalidCopilotLicense`, §5),
-whatever the model, and served under `OfficeWebIncludedCopilot`, which `M365_SCENARIO` selects for the
-proxy and the probes (hypotheses §49 F145).
+account gets no answer under the `officeweb` scenario on either transport, whatever the model, and is
+served under `OfficeWebIncludedCopilot`, which `M365_SCENARIO` selects for the proxy and the probes
+(hypotheses §49 F145). On Nov 20 2026 every model got `InvalidCopilotLicense` there (§5). Since Nov 23
+a tone without its own licence gate (`Gpt_5_5_Chat`, `magic`) gets a turn that ends `Success` with no
+text and no `errorCode`, on either transport, whose only bot messages are an EarlyProgress one and, on
+Chathub, an empty `ReferencesListComplete` one. A Claude or GPT-6.x tone gets its model refusal, as on
+the included scenario (§5; hypotheses §61 F170).
 
 **Query string** (the client's order): `chatsessionid`, `XRoutingParameterSessionKey` (the user's `oid`:
 a browser can't set the Chathub header), `clientrequestid`, `X-SessionId`, `disableMemory=1` for a
@@ -1072,9 +1141,10 @@ Headers: `Origin: https://copilot.cloud.microsoft` and a browser `User-Agent`.
 - `{messages}`: Progress messages, the user echo, the final snapshot of a short answer
   (`isLastUpdate`), and an `EndOfRequest` message whose `author` is `null`. A chain-of-thought message
   (§6) comes this way, its whole text again each time it grows, and isn't restated at the end of the turn.
-- `{throttling}`: the message cap. It carried no `metering` in any observed turn (the web client
-  also asks for `MeteringInfo` messages; not tried), so the proxy can't see priority-access
-  allowances on StreamHub.
+- `{throttling}`: the message cap. It carried no `metering` in any observed turn, under
+  `OfficeWebPaidCopilot` too (the web client also asks for `MeteringInfo` messages; not tried), so the
+  proxy can't read priority-access allowances on StreamHub. The turns still spend the budgets, except
+  `Claude_Auto` turns (§5, *priority access*; hypotheses §62).
 - `{cursor, messages}`: names the message the next deltas extend, and **restates it**, usually as `""`.
 - `{w: "…"}`: a delta — Chathub's `writeAtCursor`, renamed.
 - `{patches, isLastUpdate}`: JSON patches (suggestions, metadata).

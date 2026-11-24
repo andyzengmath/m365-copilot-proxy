@@ -190,13 +190,17 @@ export function priorityAccessExhaustionOf(
 
 // --- The account's daily turn limit (docs/m365-copilot-api.md §7) ----------
 //
-// A non-premium ("Basic") account gets 50 turns per UTC day across every model
-// (`TotalTurnUsageDaily` in `throttling.metering`). Past it M365 refuses each
-// turn from `BotConnection` with `result: {value: "OutOfCredits", errorCode:
+// A non-premium account has a daily turn allowance across every model
+// (`TotalTurnUsageDaily` in `throttling.metering`), reset at 00:00 UTC. Its size
+// differs between accounts: 50 on the Basic account the usage-limit study ran
+// on, 999 on a non-premium account in another tenant (docs/hypotheses.md §61
+// F167). A premium account reports none. Past it M365 refuses each turn from
+// `BotConnection` with `result: {value: "OutOfCredits", errorCode:
 // "TotalTurnDailyQuotaExhausted", creditScenario: "TotalTurn"}` and the text
-// "You've used your daily chat limit. Please try again tomorrow." It refuses
-// every chat model alike, so it is remembered for the whole account, and no
-// fallback model helps. Image generation still works past it.
+// "You've used your daily chat limit. Please try again tomorrow." On the
+// study's account it refused every chat model alike, so it is remembered for
+// the whole account, and no fallback model helps. Image generation still
+// worked past it.
 
 /** Key the account-wide daily turn limit is remembered under. */
 export const DAILY_TURN_LIMIT_KEY = "account:total-turn-daily";
@@ -209,7 +213,11 @@ function dailyTurnLimitOf(
   now: Date,
 ): PriorityAccessExhaustion | null {
   const byCode = result?.value === "OutOfCredits" && result.errorCode === "TotalTurnDailyQuotaExhausted";
-  const byText = !result?.errorCode && DAILY_LIMIT_RE.test(result?.message ?? text ?? "");
+  // The refusal has always come with its errorCode, on Chathub and StreamHub. The
+  // text alone counts only when the turn didn't succeed: an answer that quotes the
+  // refusal (a tool call that edits this file, say) would otherwise 429 every
+  // chat model until 00:00 UTC, which is most of a day on a 999-turn account.
+  const byText = result?.value !== "Success" && !result?.errorCode && DAILY_LIMIT_RE.test(result?.message ?? text ?? "");
   if (!byCode && !byText) return null;
   const message = (result?.message ?? text ?? "").trim() || "TotalTurnDailyQuotaExhausted";
   return { window: "day", scope: "account", resetsAt: nextUtcMidnight(now), message };
